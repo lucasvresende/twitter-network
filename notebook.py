@@ -8,6 +8,7 @@ with app.setup:
 
     import marimo as mo
     import polars as pl
+    import polars.selectors as cs
     import networkx as nx
 
 
@@ -44,18 +45,26 @@ def _(TWITTER_COMBINED_TXT_PATH):
     return (edges_lf,)
 
 
-@app.cell
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Gather Node Data
+    """)
+    return
+
+
+@app.cell(hide_code=True)
 def _(edges_lf):
-    followers_lf = (
+    _followers_lf = (
         edges_lf.group_by("to")
         .agg(
-            pl.col("from").count().alias("follower_count"),
+            pl.col("from").count().alias("followers_count"),
             pl.col("from").implode().alias("followers"),
         )
         .rename({"to": "node"})
     )
 
-    following_lf = (
+    _following_lf = (
         edges_lf.group_by("from")
         .agg(
             pl.col("to").count().alias("following_count"),
@@ -64,9 +73,10 @@ def _(edges_lf):
         .rename({"from": "node"})
     )
 
-    nodes_info_lf = (
-        followers_lf.join(
-            following_lf,
+    # Data on followers, following, and friends for all nodes
+    nodes_lf = (
+        _followers_lf.join(
+            _following_lf,
             on="node",
             how="full",
         )
@@ -74,64 +84,86 @@ def _(edges_lf):
             pl.col("followers").list.set_intersection("following").alias("friends"),
         )
         .with_columns(
-            pl.col("friends").list.len().alias("friend_count"),
+            pl.col("friends").list.len().alias("friends_count"),
         )
         .select(
             pl.col("node").fill_null(pl.col("node_right")),
-            pl.col("follower_count").fill_null(0),
+            pl.col(f"followers_count").fill_null(0),
             pl.col("following_count").fill_null(0),
-            pl.col("friend_count").fill_null(0),
+            pl.col("friends_count").fill_null(0),
             pl.col("followers").fill_null([]),
             pl.col("following").fill_null([]),
             pl.col("friends").fill_null([]),
         )
     )
 
-    mo.ui.table(nodes_info_lf)
-    return
+    mo.ui.table(nodes_lf)
+    return (nodes_lf,)
 
 
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## Convert Subset to Network
+    ## Select Node To Analyze
     """)
     return
 
 
 @app.cell
-def _(edges_lf):
-    ego_nodes = (
-        edges_lf.select(pl.col("from"))
-        .unique(maintain_order=True)
-        .collect()
-        .to_series()
-        .to_list()
-    )
+def _():
+    RELATIONSHIP_TYPES = ["followers", "following", "friends"]
+    return (RELATIONSHIP_TYPES,)
 
-    ego_node_dropdown = mo.ui.dropdown(
-        options=ego_nodes,
-        value=ego_nodes[0],
-        label="Choose an ego node",
-    )
 
-    ego_node_dropdown
+@app.cell(hide_code=True)
+def _(nodes_lf):
+    ego_nodes = nodes_lf.select("node").sort("node").collect().to_series().to_list()
+
+    (
+        ego_node_dropdown := mo.ui.dropdown(
+            options=ego_nodes,
+            value=ego_nodes[0],
+            label="Choose an ego node",
+        )
+    )
     return (ego_node_dropdown,)
 
 
-@app.cell
-def _(edges_lf, ego_node_dropdown):
+@app.cell(hide_code=True)
+def _(RELATIONSHIP_TYPES, ego_node_dropdown, nodes_lf):
     ego_node = ego_node_dropdown.value
 
-    ego_edges_lf = edges_lf.filter(
-        (pl.col("from") == ego_node) | (pl.col("to") == ego_node)
+    # The ego node + everyone the ego follows (Alters)
+    ego_following_series = pl.Series([ego_node]).append(
+        nodes_lf.filter(pl.col("node") == ego_node)
+        .select(pl.col("following").explode())
+        .collect()
+        .to_series()
     )
-    return (ego_edges_lf,)
 
+    ### The LazyFrame with the network data
+    egocentric_network_lf = (
+        nodes_lf.filter(
+            pl.col("node").is_in(ego_following_series),
+        )
+        .with_columns(
+            pl.col(RELATIONSHIP_TYPES)
+            .list.filter(pl.element().is_in(ego_following_series))
+            .name.prefix("alter_")
+        )
+        .with_columns(
+            pl.col("^alter_.*$").list.len().name.suffix("_count"),
+        )
+        .select(
+            "node",
+            *[
+                pl.col([f"{rel}_count", f"{rel}", f"alter_{rel}_count", f"alter_{rel}"])
+                for rel in RELATIONSHIP_TYPES
+            ],
+        )
+    )
 
-@app.cell
-def _(ego_edges_lf):
-    mo.ui.table(ego_edges_lf)
+    mo.ui.table(egocentric_network_lf)
     return
 
 
