@@ -5,6 +5,7 @@ app = marimo.App(width="medium", auto_download=["html"], sql_output="native")
 
 with app.setup:
     from pathlib import Path
+    from collections.abc import Sequence, Generator
 
     import marimo as mo
     import polars as pl
@@ -20,12 +21,21 @@ def _():
     return
 
 
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ### Edges
+    """)
+    return
+
+
 @app.cell
 def _():
     ROOT_PATH = Path(__file__).resolve().parent
+
     DATA_PATH = ROOT_PATH / "data"
     TWITTER_COMBINED_TXT_PATH = DATA_PATH / "twitter_combined.txt"
-    return (TWITTER_COMBINED_TXT_PATH,)
+    return DATA_PATH, TWITTER_COMBINED_TXT_PATH
 
 
 @app.cell
@@ -40,9 +50,62 @@ def _(TWITTER_COMBINED_TXT_PATH):
         .unique(["from", "to"])
         .sort(["from", "to"])
     )
-
-    mo.ui.table(edges_lf)
     return (edges_lf,)
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ### Features
+    """)
+    return
+
+
+@app.cell
+def _(DATA_PATH):
+    TWITTER_EGO_FILES_PATH = DATA_PATH / "twitter"
+
+    CIRCLES_FILES = list(TWITTER_EGO_FILES_PATH.rglob("*.circles"))
+    EDGES_FILES = list(TWITTER_EGO_FILES_PATH.rglob("*.edges"))
+    FEAT_FILES = list(TWITTER_EGO_FILES_PATH.rglob("*.feat"))
+    FEATNAMES_FILES = list(TWITTER_EGO_FILES_PATH.rglob("*.featnames"))
+    return (FEATNAMES_FILES,)
+
+
+@app.cell
+def _(FEATNAMES_FILES):
+    _ego_nodes = [f.stem for f in FEATNAMES_FILES]
+
+    _feats_items = [
+        (
+            pl.DataFrame(
+                {
+                    "raw_line": file_name.read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    ).splitlines()
+                }
+            )
+            .lazy()
+            .filter(pl.col("raw_line").str.strip_chars() != "")
+            .select(
+                pl.lit(node).cast(pl.Int64).alias("ego_node"),
+                pl.col("raw_line")
+                .str.extract(r"^\s*(\d+)\s+(.+?)\s*$", group_index=1)
+                .cast(pl.Int64)
+                .alias("index"),
+                pl.col("raw_line")
+                .str.extract(r"^\s*(\d+)\s+(.+?)\s*$", group_index=2)
+                .alias("name"),
+            )
+        )
+        for file_name, node in zip(FEATNAMES_FILES, _ego_nodes)
+    ]
+
+    feats_lf = pl.concat(_feats_items, how="vertical").sort("ego_node")
+
+    feats_lf.collect()
+    return
 
 
 @app.cell(hide_code=True)
@@ -109,12 +172,6 @@ def _():
     return
 
 
-@app.cell
-def _():
-    RELATIONSHIP_TYPES = ["followers", "following", "friends"]
-    return (RELATIONSHIP_TYPES,)
-
-
 @app.cell(hide_code=True)
 def _(nodes_lf):
     ego_nodes = nodes_lf.select("node").sort("node").collect().to_series().to_list()
@@ -130,8 +187,9 @@ def _(nodes_lf):
 
 
 @app.cell(hide_code=True)
-def _(RELATIONSHIP_TYPES, ego_node_dropdown, nodes_lf):
+def _(ego_node_dropdown, nodes_lf):
     ego_node = ego_node_dropdown.value
+    RELATIONSHIP_TYPES = ["followers", "following", "friends"]
 
     # The ego node + everyone the ego follows (Alters)
     ego_following_series = pl.Series([ego_node]).append(
@@ -164,6 +222,11 @@ def _(RELATIONSHIP_TYPES, ego_node_dropdown, nodes_lf):
     )
 
     mo.ui.table(egocentric_network_lf)
+    return
+
+
+@app.cell
+def _():
     return
 
 
