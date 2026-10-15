@@ -4,18 +4,22 @@ __generated_with = "0.25.1"
 app = marimo.App(width="medium", auto_download=["html"], sql_output="native")
 
 with app.setup:
+    # Standard-library utilities for paths, type hints, and atomic cache writes.
     from pathlib import Path
     from collections.abc import Sequence, Generator
     from tempfile import TemporaryDirectory
 
+    # Notebook UI, lazy data processing, column selectors, and graph analysis.
     import marimo as mo
     import polars as pl
     import polars.selectors as cs
     import networkx as nx
 
 
-@app.cell(hide_code=True)
+@app.cell
 def _():
+    # Resolve every data location relative to this notebook so it can be run
+    # from any working directory.
     ROOT_PATH = Path(__file__).resolve().parent
 
     DATA_PATH = ROOT_PATH / "data"
@@ -28,6 +32,11 @@ def _():
 def _():
     mo.md(r"""
     ## Load Data
+
+    The source dataset is loaded into Polars `LazyFrame` objects so transformations
+    are deferred until a result is displayed, cached, or explicitly collected.
+    Whenever a Parquet cache already exists, the notebook scans it instead of
+    reparsing the original text files.
     """)
     return
 
@@ -36,12 +45,18 @@ def _():
 def _():
     mo.md(r"""
     ### Edges
+
+    Each row is a directed Twitter relationship from `from` to `to`. The loader
+    prefers `data/out/edges.parquet`; otherwise it reads `twitter_combined.txt`,
+    removes duplicate edges, and sorts the result for deterministic output.
     """)
     return
 
 
-@app.cell(hide_code=True)
+@app.cell
 def _(PARQUET_OUT_PATH, TWITTER_COMBINED_TXT_PATH):
+    # Reuse the normalized edge cache when available. On the first run, build the
+    # same logical dataset lazily from the space-delimited source file.
     _cache_path = PARQUET_OUT_PATH / "edges.parquet"
     if _cache_path.is_file():
         loaded_edges_lf = pl.scan_parquet(_cache_path)
@@ -63,12 +78,25 @@ def _(PARQUET_OUT_PATH, TWITTER_COMBINED_TXT_PATH):
 def _():
     mo.md(r"""
     ### Features
+
+    Twitter ego-network features are split across several file types:
+
+    - `.featnames` maps an ego-specific feature index to its description.
+    - `.feat` stores alter node IDs followed by binary feature vectors.
+    - `.egofeat` stores the ego node's binary feature vector without a node ID.
+    - `.circles` and `.edges` are discovered for possible later analysis but are
+      not transformed in this section.
+
+    Feature indices are local to an ego network, so `ego_node` is retained as part
+    of every feature key.
     """)
     return
 
 
-@app.cell(hide_code=True)
+@app.cell
 def _(DATA_PATH):
+    # Discover every ego-network source file recursively. Sorting makes file
+    # processing and resulting row order reproducible across operating systems.
     TWITTER_EGO_FILES_PATH = DATA_PATH / "twitter"
 
     CIRCLES_FILES = sorted(TWITTER_EGO_FILES_PATH.rglob("*.circles"))
@@ -79,8 +107,11 @@ def _(DATA_PATH):
     return EGOFEAT_FILES, FEATNAMES_FILES, FEAT_FILES, TWITTER_EGO_FILES_PATH
 
 
-@app.cell(hide_code=True)
+@app.cell
 def _(FEATNAMES_FILES, PARQUET_OUT_PATH):
+    # Produce one metadata row per ego-specific feature index:
+    # (ego_node, index, name). Feature indices cannot be joined across ego networks
+    # without including ego_node because each .featnames file defines its own map.
     _cache_path = PARQUET_OUT_PATH / "feature_names.parquet"
     if _cache_path.is_file():
         loaded_feats_lf = pl.scan_parquet(_cache_path)
@@ -116,8 +147,11 @@ def _(FEATNAMES_FILES, PARQUET_OUT_PATH):
     return (loaded_feats_lf,)
 
 
-@app.cell(hide_code=True)
+@app.cell
 def _(EGOFEAT_FILES, FEAT_FILES, PARQUET_OUT_PATH, TWITTER_EGO_FILES_PATH):
+    # Normalize .feat and .egofeat records to one row per node:
+    # (ego_node, node, is_ego, features). Keeping features as List[Int8] supports
+    # different vector lengths across ego networks without creating sparse columns.
     _cache_path = PARQUET_OUT_PATH / "node_feature_vectors.parquet"
     if _cache_path.is_file():
         loaded_node_feature_vectors_lf = pl.scan_parquet(_cache_path)
@@ -130,7 +164,9 @@ def _(EGOFEAT_FILES, FEAT_FILES, PARQUET_OUT_PATH, TWITTER_EGO_FILES_PATH):
         if any(not _path.stem.isdecimal() for _path in _feature_paths):
             raise ValueError("Feature filenames must have numeric ego-node IDs")
 
-        # Tokenize whole lines to support varying vector lengths and whitespace.
+        # Read each source line as one string and tokenize its whitespace. For a
+        # .feat row, the first token is the node ID; for .egofeat, the node ID is
+        # the ego ID encoded in the filename.
         loaded_node_feature_vectors_lf = (
             pl.scan_csv(
                 _feature_paths,
@@ -172,26 +208,39 @@ def _():
     mo.md(f"""
     ## Save Data to Parquet
 
-    Missing caches are created automatically in **`data/out`** using Zstandard
-    compression. Existing caches are reused without rewriting them. Downstream
-    analysis uses lazy Parquet scans, including on the first run after export.
+    This section converts the normalized lazy datasets into reusable Parquet
+    caches under **`data/out`**. Missing caches are written with Zstandard
+    compression; existing files are reused without being rewritten. Downstream
+    cells always receive a fresh lazy scan of the Parquet file, so the application
+    benefits from predicate and column pushdown.
 
-    - `edges.parquet`: deduplicated, sorted edges
-    - `feature_names.parquet`: feature names indexed by ego network
-    - `node_feature_vectors.parquet`: feature lists for nodes and egos
+    Cached datasets:
 
-    The expanded long-form feature table is not saved, to avoid duplicating data.
+    - `edges.parquet`: deduplicated and sorted directed edges
+    - `feature_names.parquet`: feature descriptions keyed by ego and index
+    - `node_feature_vectors.parquet`: binary feature lists for alters and egos
 
-    **Refreshing the cache:** changes to source files or preprocessing are not
-    tracked automatically. Delete the affected Parquet files from `data/out` and
-    restart/run the notebook from the loading section to rebuild them.
+    The expanded long-form feature table is intentionally not cached because it
+    would duplicate the compact list representation.
+
+    > To rebuild after changing source files or preprocessing logic, delete the
+    > affected file from `data/out` and rerun the loading section.
     """)
     return
 
 
 @app.function(hide_code=True)
-def cache_lazyframe_to_parquet(frame: pl.LazyFrame, path: Path):
-    """Create a missing cache safely, then return its lazy scan and status."""
+def cache_lazyframe_to_parquet(
+    frame: pl.LazyFrame,
+    path: Path,
+) -> tuple[pl.LazyFrame, dict]:
+    """Cache a LazyFrame atomically and return its lazy scan plus a report.
+
+    A new dataset is first written inside a temporary directory, validated by
+    comparing schemas, and then moved into its final path. This prevents an
+    interrupted write from leaving a partial cache. Existing caches are left
+    untouched.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     created = not path.is_file()
     if created:
@@ -222,6 +271,9 @@ def _(
     loaded_feats_lf,
     loaded_node_feature_vectors_lf,
 ):
+    # Materialize each missing cache, then expose only Parquet-backed LazyFrames to
+    # the rest of the notebook. The report makes cache state, row count, and disk
+    # usage visible without collecting the full datasets into Python memory.
     edges_lf, _edges_cache_report = cache_lazyframe_to_parquet(
         loaded_edges_lf,
         PARQUET_OUT_PATH / "edges.parquet",
@@ -246,27 +298,42 @@ def _(
 def _():
     mo.md(r"""
     ### Consolidated Feature View
+
+    The cached `node_feature_vectors_lf` keeps one compact binary list per node.
+    For analysis that needs individual features, the next cell derives
+    `node_features_lf` with one row per feature value and joins each local index to
+    its description.
+
+    Because this expanded view can be large, keep it lazy and filter by
+    `ego_node`, `node`, or `value` before calling `collect()`. The displayed table
+    below shows the compact vector dataset, not the expanded long-form result.
     """)
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(feats_lf, node_feature_vectors_lf):
-    # Optional long-form view: one row per (ego_node, node, feature index).
-    # Filter by ego_node/node before collecting this potentially large table.
+    # Expand each binary vector into rows keyed by its zero-based feature index,
+    # then attach the ego-specific feature description. This remains lazy; filters
+    # applied downstream can be pushed into the Parquet scans where possible.
     node_features_lf = (
         node_feature_vectors_lf.with_columns(
-            pl.int_ranges(0, pl.col("features").list.len(), dtype=pl.Int64).alias(
-                "index"
-            )
+            pl.int_ranges(
+                0,
+                pl.col("features").list.len(),
+                dtype=pl.Int64,
+            ).alias("index"),
         )
         .explode("index", "features")
         .rename({"features": "value"})
         .join(feats_lf, on=["ego_node", "index"], how="left")
         .select("ego_node", "node", "is_ego", "index", "name", "value")
+        .sort(["ego_node", "node"])
     )
 
-    mo.ui.table(node_feature_vectors_lf.head(10).collect(), selection=None)
+    # Display the compact cached representation to avoid rendering the much larger
+    # exploded table by default.
+    mo.ui.table(node_feature_vectors_lf)
     return
 
 
@@ -274,12 +341,24 @@ def _(feats_lf, node_feature_vectors_lf):
 def _():
     mo.md(r"""
     ## Gather Node Data
+
+    The directed edge list is aggregated into one row per Twitter node. For each
+    node, the next cell computes:
+
+    - **followers**: nodes with an edge pointing to this node
+    - **following**: nodes this node points to
+    - **friends**: the intersection of followers and following (mutual edges)
+
+    Both the member lists and their counts are retained. Nodes appearing on only
+    one side of an edge are preserved by a full join, and missing lists/counts are
+    replaced with empty lists and zeros.
     """)
     return
 
 
 @app.cell(hide_code=True)
 def _(edges_lf):
+    # Aggregate incoming edges to obtain each node's followers.
     _followers_lf = (
         edges_lf.group_by("to")
         .agg(
@@ -289,6 +368,7 @@ def _(edges_lf):
         .rename({"to": "node"})
     )
 
+    # Aggregate outgoing edges to obtain the accounts each node follows.
     _following_lf = (
         edges_lf.group_by("from")
         .agg(
@@ -298,7 +378,8 @@ def _(edges_lf):
         .rename({"from": "node"})
     )
 
-    # Data on followers, following, and friends for all nodes
+    # Combine both directions and identify mutual relationships. The full join
+    # preserves nodes that have only incoming or only outgoing edges.
     nodes_lf = (
         _followers_lf.join(
             _following_lf,
@@ -313,7 +394,7 @@ def _(edges_lf):
         )
         .select(
             pl.col("node").fill_null(pl.col("node_right")),
-            pl.col(f"followers_count").fill_null(0),
+            pl.col("followers_count").fill_null(0),
             pl.col("following_count").fill_null(0),
             pl.col("friends_count").fill_null(0),
             pl.col("followers").fill_null([]),
@@ -329,22 +410,32 @@ def _(edges_lf):
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## Select Node To Analyze
+    ## Select Node to Analyze
+
+    Choose an ego node to construct a reactive egocentric network. Changing the
+    dropdown reruns only the dependent cells. This notebook defines the network as
+    the selected ego plus every account the ego follows.
+
+    The resulting table retains each node's global relationship lists and adds
+    `alter_*` columns restricted to members of this selected network.
     """)
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(nodes_lf):
+    # Materialize only the sorted node IDs needed as dropdown options. The selected
+    # value is read in the next cell because marimo UI values cannot be consumed in
+    # the same cell where the UI element is defined.
     ego_nodes = nodes_lf.select("node").sort("node").collect().to_series().to_list()
 
-    (
-        ego_node_dropdown := mo.ui.dropdown(
-            options=ego_nodes,
-            value=ego_nodes[0],
-            label="Choose an ego node",
-        )
+    ego_node_dropdown = mo.ui.dropdown(
+        options=ego_nodes,
+        value=ego_nodes[0],
+        label="Choose an ego node",
     )
+
+    ego_node_dropdown
     return (ego_node_dropdown,)
 
 
@@ -353,7 +444,7 @@ def _(ego_node_dropdown, nodes_lf):
     ego_node = ego_node_dropdown.value
     RELATIONSHIP_TYPES = ["followers", "following", "friends"]
 
-    # The ego node + everyone the ego follows (Alters)
+    # Define membership as the selected ego plus every node the ego follows.
     _ego_following_series = pl.Series([ego_node]).append(
         nodes_lf.filter(pl.col("node") == ego_node)
         .select(pl.col("following").explode())
@@ -361,7 +452,8 @@ def _(ego_node_dropdown, nodes_lf):
         .to_series()
     )
 
-    ### The LazyFrame with the network data
+    # Keep global relationship columns for context, then derive alter_* lists and
+    # counts containing only relationships whose endpoints belong to this network.
     egocentric_network_lf = (
         nodes_lf.filter(
             pl.col("node").is_in(_ego_following_series),
