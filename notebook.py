@@ -18,7 +18,7 @@ with app.setup:
     import polars.selectors as cs
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _():
     # Resolve every data location relative to this notebook so it can be run
     # from any working directory.
@@ -55,7 +55,7 @@ def _():
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(PARQUET_OUT_PATH, TWITTER_COMBINED_TXT_PATH):
     # Reuse the normalized edge cache when available. On the first run, build the
     # same logical dataset lazily from the space-delimited source file.
@@ -95,7 +95,7 @@ def _():
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(DATA_PATH):
     # Discover every ego-network source file recursively. Sorting makes file
     # processing and resulting row order reproducible across operating systems.
@@ -109,7 +109,7 @@ def _(DATA_PATH):
     return EGOFEAT_FILES, FEATNAMES_FILES, FEAT_FILES, TWITTER_EGO_FILES_PATH
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(FEATNAMES_FILES, PARQUET_OUT_PATH):
     # Produce one metadata row per ego-specific feature index:
     # (ego_node, index, name). Feature indices cannot be joined across ego networks
@@ -149,7 +149,7 @@ def _(FEATNAMES_FILES, PARQUET_OUT_PATH):
     return (loaded_feats_lf,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(EGOFEAT_FILES, FEAT_FILES, PARQUET_OUT_PATH, TWITTER_EGO_FILES_PATH):
     # Normalize .feat and .egofeat records to one row per node:
     # (ego_node, node, is_ego, features). Keeping features as List[Int8] supports
