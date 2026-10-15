@@ -1,3 +1,5 @@
+# ruff: noqa: PLR1711
+
 import marimo
 
 __generated_with = "0.25.1"
@@ -5,15 +7,15 @@ app = marimo.App(width="medium", auto_download=["html"], sql_output="native")
 
 with app.setup:
     # Standard-library utilities for paths, type hints, and atomic cache writes.
+    from collections.abc import Generator, Sequence
     from pathlib import Path
-    from collections.abc import Sequence, Generator
     from tempfile import TemporaryDirectory
 
     # Notebook UI, lazy data processing, column selectors, and graph analysis.
     import marimo as mo
+    import networkx as nx
     import polars as pl
     import polars.selectors as cs
-    import networkx as nx
 
 
 @app.cell
@@ -205,7 +207,7 @@ def _(EGOFEAT_FILES, FEAT_FILES, PARQUET_OUT_PATH, TWITTER_EGO_FILES_PATH):
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(f"""
+    mo.md("""
     ## Save Data to Parquet
 
     This section converts the normalized lazy datasets into reusable Parquet
