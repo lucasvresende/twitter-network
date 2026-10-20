@@ -242,7 +242,7 @@ def _():
     return
 
 
-@app.function
+@app.function(hide_code=True)
 def cache_lazyframe_to_parquet(
     frame: pl.LazyFrame,
     path: Path,
@@ -355,7 +355,7 @@ def _():
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(PARQUET_OUT_PATH, feats_lf, loaded_node_feature_vectors_lf):
     if loaded_node_feature_vectors_lf is None:
         node_feature_lists_lf = pl.scan_parquet(
