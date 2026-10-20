@@ -6,16 +6,13 @@ __generated_with = "0.25.1"
 app = marimo.App(width="medium", auto_download=["html"], sql_output="native")
 
 with app.setup:
-    # Standard-library utilities for paths, type hints, and atomic cache writes.
-    from collections.abc import Generator, Sequence
     from pathlib import Path
     from tempfile import TemporaryDirectory
 
-    # Notebook UI, lazy data processing, column selectors, and graph analysis.
     import marimo as mo
-    import networkx as nx
     import polars as pl
-    import polars.selectors as cs
+    import numpy as np
+    import altair as alt
 
 
 @app.cell(hide_code=True)
@@ -513,6 +510,513 @@ def _(
     (PARQUET_OUT_PATH / "node_feature_vectors.parquet").unlink(missing_ok=True)
     mo.ui.table(nodes_lf)
     return (nodes_lf,)
+
+
+@app.cell
+def degree_analysis_intro():
+    mo.md(r"""
+    ## 1. Degree distributions and connection inequality
+
+    Compare **followers (in-degree)**, **following (out-degree)**, and
+    **mutual connections** across every node in the consolidated dataset,
+    including nodes with zero connections. These are observed relationships in
+    this dataset, not complete Twitter account totals.
+
+    The distribution views describe typical values and the long tail. The
+    inequality views describe how connections are distributed among nodes.
+    Mutual counts measure node incidences, rather than distinct mutual pairs.
+    """)
+    return
+
+
+@app.function
+def compute_degree_profile(values: np.ndarray) -> dict:
+    """Summarize nonnegative integer counts, retaining zero-degree nodes.
+
+    ECDF uses P(D <= k); inclusive CCDF uses P(D >= k), both divided by
+    all nodes. Lorenz points are compressed at tied-degree boundaries,
+    which preserves the exact piecewise-linear curve and its Gini area.
+    An all-zero population has undefined connection shares and Gini.
+    """
+    values = np.asarray(values)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("Degree counts must be a nonempty one-dimensional array")
+    if not np.issubdtype(values.dtype, np.integer) or np.any(values < 0):
+        raise ValueError("Degree counts must be nonnegative integers")
+    values = values.astype(np.int64)
+    ordered = np.sort(values)
+    size = ordered.size
+    total = int(ordered.sum())
+    degrees, counts = np.unique(ordered, return_counts=True)
+    cumulative_nodes = counts.cumsum()
+    population_share = np.r_[0.0, cumulative_nodes / size]
+    connection_share = (
+        np.r_[0.0, (degrees * counts).cumsum() / total]
+        if total
+        else np.full(degrees.size + 1, np.nan)
+    )
+    # Integer-aligned bins cover the complete range, including zero.
+    bin_width = max(1, int(np.ceil((int(ordered[-1]) + 1) / 40)))
+    bin_edges = np.arange(0, int(ordered[-1]) + bin_width + 1, bin_width)
+    bin_counts, bin_edges = np.histogram(ordered, bins=bin_edges)
+    top_shares = []
+    for fraction in (0.001, 0.01, 0.05, 0.10, 0.20):
+        top_nodes = max(1, int(np.ceil(size * fraction)))
+        top_connections = int(ordered[-top_nodes:].sum())
+        top_shares.append(
+            {
+                "top_fraction": fraction,
+                "top_group": f"Top {fraction:.1%}"
+                if fraction < 0.01
+                else f"Top {fraction:.0%}",
+                "nodes": top_nodes,
+                "actual_node_share": top_nodes / size,
+                "connections": top_connections,
+                "connection_share": top_connections / total if total else None,
+            }
+        )
+    return {
+        "summary": {
+            "nodes": size,
+            "total": total,
+            "mean": float(ordered.mean()),
+            "std": float(ordered.std()),
+            "median": float(np.median(ordered)),
+            "p90": float(np.quantile(ordered, 0.90)),
+            "p99": float(np.quantile(ordered, 0.99)),
+            "maximum": int(ordered[-1]),
+            "zero_nodes": int(counts[0]) if degrees[0] == 0 else 0,
+            "zero_share": float(np.mean(ordered == 0)),
+            "gini": float(1 - 2 * np.trapezoid(connection_share, population_share))
+            if total
+            else None,
+        },
+        "frequency": pl.DataFrame(
+            {
+                "degree": degrees,
+                "nodes": counts,
+                "ecdf": cumulative_nodes / size,
+                "ccdf": (size - cumulative_nodes + counts) / size,
+            }
+        ),
+        "histogram": pl.DataFrame(
+            {
+                "lower": bin_edges[:-1],
+                "upper": bin_edges[1:],
+                "nodes": bin_counts,
+            }
+        ),
+        "lorenz": pl.DataFrame(
+            {
+                "population_share": population_share,
+                "connection_share": connection_share,
+            }
+        ).fill_nan(None),
+        "top_shares": pl.DataFrame(top_shares),
+    }
+
+
+@app.cell
+def degree_analysis_data(nodes_lf):
+    # Collect only scalar counts; relationship and feature lists stay in Parquet.
+    degree_counts = nodes_lf.select(
+        "node", "followers_count", "following_count", "friends_count"
+    ).collect()
+    mo.stop(
+        degree_counts.is_empty(), mo.md("No nodes are available for degree analysis.")
+    )
+
+    degree_metrics = {
+        "Followers (in-degree)": "followers_count",
+        "Following (out-degree)": "following_count",
+        "Mutual connections": "friends_count",
+    }
+    degree_profiles = {
+        _label: compute_degree_profile(degree_counts[_column].to_numpy())
+        for _label, _column in degree_metrics.items()
+    }
+    degree_summary = pl.DataFrame(
+        [
+            {"metric": _label, **_profile["summary"]}
+            for _label, _profile in degree_profiles.items()
+        ]
+    )
+    degree_top_shares = pl.concat(
+        [
+            _profile["top_shares"].with_columns(pl.lit(_label).alias("metric"))
+            for _label, _profile in degree_profiles.items()
+        ]
+    )
+    return (
+        degree_counts,
+        degree_metrics,
+        degree_profiles,
+        degree_summary,
+        degree_top_shares,
+    )
+
+
+@app.cell
+def degree_analysis_summary(degree_counts, degree_summary):
+    mo.vstack(
+        [
+            mo.md(f"### Summary across {degree_counts.height:,} nodes"),
+            mo.ui.table(
+                degree_summary.select(
+                    pl.col("metric").alias("Relationship"),
+                    pl.col("mean").alias("Mean"),
+                    pl.col("median").alias("Median"),
+                    pl.col("p90").alias("P90"),
+                    pl.col("p99").alias("P99"),
+                    pl.col("maximum").alias("Maximum"),
+                    pl.col("zero_nodes").alias("Zero-degree nodes"),
+                    pl.col("zero_share").alias("Zero-degree share"),
+                ),
+                selection=None,
+                pagination=False,
+                show_column_summaries=False,
+                show_data_types=False,
+                format_mapping={
+                    "Mean": "{:.2f}",
+                    "Median": "{:,.1f}",
+                    "P90": "{:,.1f}",
+                    "P99": "{:,.1f}",
+                    "Maximum": "{:,}",
+                    "Zero-degree nodes": "{:,}",
+                    "Zero-degree share": "{:.3%}",
+                },
+            ),
+            mo.md(
+                "Percentiles use linear interpolation. All rows use the same node population, including zeros."
+            ),
+        ]
+    )
+    return
+
+
+@app.cell
+def degree_analysis_selector(degree_metrics):
+    degree_metric_selector = mo.ui.dropdown(
+        options=list(degree_metrics),
+        value="Followers (in-degree)",
+        label="Relationship to explore",
+    )
+    degree_metric_selector
+    return (degree_metric_selector,)
+
+
+@app.cell
+def degree_analysis_selection(degree_metric_selector, degree_profiles):
+    selected_degree_metric = degree_metric_selector.value
+    selected_degree_profile = degree_profiles[selected_degree_metric]
+    selected_degree_summary = selected_degree_profile["summary"]
+    return (
+        selected_degree_metric,
+        selected_degree_profile,
+        selected_degree_summary,
+    )
+
+
+@app.cell
+def degree_analysis_distributions(
+    selected_degree_metric,
+    selected_degree_profile,
+    selected_degree_summary,
+):
+    _frequency = selected_degree_profile["frequency"]
+    _ecdf_data = _frequency.select("degree", "ecdf")
+    if _ecdf_data["degree"].min() > 0:
+        _ecdf_data = pl.concat(
+            [pl.DataFrame({"degree": [0], "ecdf": [0.0]}), _ecdf_data]
+        )
+    _tail = _frequency.filter(pl.col("degree") > 0)
+    _blue = "#2563a6"
+
+    degree_histogram_chart = (
+        alt.Chart(selected_degree_profile["histogram"])
+        .mark_bar(color=_blue, binSpacing=0)
+        .encode(
+            x=alt.X(
+                "lower:Q",
+                bin="binned",
+                title="Connections per node",
+                axis=alt.Axis(format=",d"),
+            ),
+            x2="upper:Q",
+            y=alt.Y("nodes:Q", title="Number of nodes", scale=alt.Scale(zero=True)),
+            tooltip=[
+                alt.Tooltip("lower:Q", title="From (inclusive)", format=",d"),
+                alt.Tooltip("upper:Q", title="To (exclusive)", format=",d"),
+                alt.Tooltip("nodes:Q", title="Nodes", format=",d"),
+            ],
+        )
+        .properties(
+            title=f"Degree histogram — {selected_degree_metric}",
+            width="container",
+            height=300,
+        )
+    )
+    degree_ecdf_chart = (
+        alt.Chart(_ecdf_data)
+        .mark_line(color=_blue, interpolate="step-after")
+        .encode(
+            x=alt.X(
+                "degree:Q", title="Connections per node (k)", scale=alt.Scale(zero=True)
+            ),
+            y=alt.Y(
+                "ecdf:Q",
+                title="Share of nodes with degree ≤ k",
+                axis=alt.Axis(format=".0%"),
+                scale=alt.Scale(domain=[0, 1]),
+            ),
+            tooltip=[
+                alt.Tooltip("degree:Q", title="Degree", format=",d"),
+                alt.Tooltip("ecdf:Q", title="Share ≤ k", format=".2%"),
+            ],
+        )
+        .properties(
+            title=f"Empirical cumulative distribution — {selected_degree_metric}",
+            width="container",
+            height=300,
+        )
+    )
+    degree_ccdf_chart = (
+        alt.Chart(_tail)
+        .mark_line(color=_blue, interpolate="step-before", point=True)
+        .encode(
+            x=alt.X(
+                "degree:Q",
+                title="Connections per node (k, log scale)",
+                axis=alt.Axis(values=[1, 10, 100, 1000, 10000], format="~s"),
+                scale=alt.Scale(type="log"),
+            ),
+            y=alt.Y(
+                "ccdf:Q",
+                title="Share with degree ≥ k (log scale)",
+                scale=alt.Scale(type="log"),
+                axis=alt.Axis(
+                    values=[1, 0.1, 0.01, 0.001, 0.0001, 0.00001], format=".3~%"
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("degree:Q", title="Degree", format=",d"),
+                alt.Tooltip("ccdf:Q", title="Share ≥ k", format=".3%"),
+            ],
+        )
+        .properties(
+            title=f"Degree tail — {selected_degree_metric}",
+            width="container",
+            height=300,
+        )
+    )
+    mo.vstack(
+        [
+            mo.md(f"### Distributions: {selected_degree_metric}"),
+            mo.md(
+                f"**Zero-degree nodes: {selected_degree_summary['zero_nodes']:,} ({selected_degree_summary['zero_share']:.3%}).** All statistics and probability denominators include these nodes."
+            ),
+            mo.ui.tabs(
+                {
+                    "Histogram": mo.vstack(
+                        [
+                            mo.md(
+                                "Equal-width, integer-aligned bins cover the full observed range. Switch to the ECDF for exact cumulative shares."
+                            ),
+                            mo.ui.altair_chart(
+                                degree_histogram_chart,
+                                chart_selection=False,
+                                legend_selection=False,
+                            ),
+                        ]
+                    ),
+                    "ECDF": mo.vstack(
+                        [
+                            mo.md(
+                                "At k, the curve gives the fraction of all nodes with at most k connections."
+                            ),
+                            mo.ui.altair_chart(
+                                degree_ecdf_chart,
+                                chart_selection=False,
+                                legend_selection=False,
+                            ),
+                        ]
+                    ),
+                    "Log-log tail": mo.vstack(
+                        [
+                            mo.md(
+                                "Only positive degrees can appear on a log axis; shares still use all nodes as the denominator. The curve is P(D ≥ k), including equality. A straight-looking tail does not establish a power law."
+                            ),
+                            mo.ui.altair_chart(
+                                degree_ccdf_chart,
+                                chart_selection=False,
+                                legend_selection=False,
+                            )
+                            if not _tail.is_empty()
+                            else mo.md(
+                                "No positive degrees are available for a log-log plot."
+                            ),
+                        ]
+                    ),
+                }
+            ),
+        ]
+    )
+    return
+
+
+@app.cell
+def degree_analysis_inequality(
+    degree_summary,
+    degree_top_shares,
+    selected_degree_metric,
+    selected_degree_profile,
+    selected_degree_summary,
+):
+    mo.stop(
+        selected_degree_summary["total"] == 0,
+        mo.md(
+            "Connection shares, the Lorenz curve, and Gini are undefined when every node has zero connections."
+        ),
+    )
+    _shares = selected_degree_profile["top_shares"]
+    _top_one = _shares.filter(pl.col("top_fraction") == 0.01).row(0, named=True)
+    _top_ten = _shares.filter(pl.col("top_fraction") == 0.10).row(0, named=True)
+    _equality = (
+        alt.Chart(pl.DataFrame({"x": [0.0, 1.0], "y": [0.0, 1.0]}))
+        .mark_line(color="#666666", strokeDash=[5, 5])
+        .encode(
+            x=alt.X("x:Q", title="Cumulative share of nodes (least to most connected)"),
+            y=alt.Y("y:Q", title="Cumulative share of connections"),
+        )
+    )
+    _lorenz = (
+        alt.Chart(selected_degree_profile["lorenz"])
+        .mark_line(color="#2563a6", strokeWidth=2)
+        .encode(
+            x=alt.X(
+                "population_share:Q",
+                title="Cumulative share of nodes (least to most connected)",
+                scale=alt.Scale(domain=[0, 1]),
+                axis=alt.Axis(format=".0%", tickCount=5),
+            ),
+            y=alt.Y(
+                "connection_share:Q",
+                title="Cumulative share of connections",
+                scale=alt.Scale(domain=[0, 1]),
+                axis=alt.Axis(format=".0%", tickCount=5),
+            ),
+            tooltip=[
+                alt.Tooltip("population_share:Q", title="Node share", format=".2%"),
+                alt.Tooltip(
+                    "connection_share:Q", title="Connection share", format=".2%"
+                ),
+            ],
+        )
+    )
+    degree_lorenz_chart = (_lorenz + _equality).properties(
+        title=f"Lorenz curve — {selected_degree_metric}", width="container", height=340
+    )
+    _share_bars = (
+        alt.Chart(_shares)
+        .mark_bar(color="#2563a6")
+        .encode(
+            x=alt.X(
+                "connection_share:Q",
+                title="Share of all connections",
+                scale=alt.Scale(domain=[0, 1]),
+                axis=alt.Axis(format=".0%", tickCount=5),
+            ),
+            y=alt.Y("top_group:N", title=None, sort=_shares["top_group"].to_list()),
+            tooltip=[
+                alt.Tooltip("top_group:N", title="Ranked group"),
+                alt.Tooltip("nodes:Q", title="Nodes in group", format=",d"),
+                alt.Tooltip(
+                    "actual_node_share:Q", title="Actual node share", format=".3%"
+                ),
+                alt.Tooltip("connections:Q", title="Connections", format=",d"),
+                alt.Tooltip(
+                    "connection_share:Q", title="Connection share", format=".2%"
+                ),
+            ],
+        )
+    )
+    degree_top_share_chart = (
+        _share_bars
+        + _share_bars.mark_text(align="left", dx=5, color="#333333").encode(
+            text=alt.Text("connection_share:Q", format=".1%")
+        )
+    ).properties(
+        title=f"Connection share held by top-ranked nodes — {selected_degree_metric}",
+        width="container",
+        height=230,
+    )
+    mo.vstack(
+        [
+            mo.md(f"### Connection inequality: {selected_degree_metric}"),
+            mo.hstack(
+                [
+                    mo.stat(
+                        f"{selected_degree_summary['gini']:.3f}",
+                        label="Gini coefficient",
+                        caption="0 = equal counts; closer to 1 = more unequal",
+                    ),
+                    mo.stat(
+                        f"{_top_one['connection_share']:.1%}",
+                        label="Connection share held by top 1%",
+                        caption=f"{_top_one['nodes']:,} nodes",
+                    ),
+                    mo.stat(
+                        f"{_top_ten['connection_share']:.1%}",
+                        label="Connection share held by top 10%",
+                        caption=f"{_top_ten['nodes']:,} nodes",
+                    ),
+                ],
+                widths="equal",
+                wrap=True,
+            ),
+            mo.ui.altair_chart(
+                degree_lorenz_chart, chart_selection=False, legend_selection=False
+            ),
+            mo.md(
+                "The dashed diagonal represents equal counts for every node. The blue Lorenz curve ranks nodes from least to most connected. Gini is twice the area between these curves, without finite-sample correction."
+            ),
+            mo.ui.altair_chart(
+                degree_top_share_chart, chart_selection=False, legend_selection=False
+            ),
+            mo.md(
+                "Top groups are nested, not additive. Each contains ceil(fraction × node count) nodes ranked independently by the selected relationship; ties at the boundary have equal counts. Hover for actual group sizes."
+            ),
+            mo.accordion(
+                {
+                    "Exact concentration statistics for all relationships": mo.ui.table(
+                        degree_summary.select("metric", "nodes", "total", "gini")
+                        .join(degree_top_shares, on="metric", how="left", suffix="_top")
+                        .select(
+                            "metric",
+                            "gini",
+                            "top_group",
+                            pl.col("nodes_top").alias("top_nodes"),
+                            "actual_node_share",
+                            "connections",
+                            "connection_share",
+                        ),
+                        selection=None,
+                        pagination=False,
+                        show_data_types=False,
+                        show_column_summaries=False,
+                        format_mapping={
+                            "gini": "{:.4f}",
+                            "actual_node_share": "{:.3%}",
+                            "connection_share": "{:.2%}",
+                            "connections": "{:,}",
+                            "top_nodes": "{:,}",
+                        },
+                    )
+                }
+            ),
+        ]
+    )
+    return
 
 
 @app.cell(hide_code=True)
