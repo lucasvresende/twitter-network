@@ -16,7 +16,7 @@ with app.setup:
 
 
 @app.cell(hide_code=True)
-def _():
+def resolve_data_paths():
     # Resolve every data location relative to this notebook so it can be run
     # from any working directory.
     ROOT_PATH = Path(__file__).resolve().parent
@@ -28,7 +28,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _():
+def describe_data_loading():
     mo.md(r"""
     ## Load Data
 
@@ -41,7 +41,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _():
+def describe_directed_edges():
     mo.md(r"""
     ### Edges
 
@@ -53,7 +53,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _(PARQUET_OUT_PATH, TWITTER_COMBINED_TXT_PATH):
+def load_directed_edges(PARQUET_OUT_PATH, TWITTER_COMBINED_TXT_PATH):
     # Reuse the normalized edge cache when available. On the first run, build the
     # same logical dataset lazily from the space-delimited source file.
     _cache_path = PARQUET_OUT_PATH / "edges.parquet"
@@ -74,7 +74,7 @@ def _(PARQUET_OUT_PATH, TWITTER_COMBINED_TXT_PATH):
 
 
 @app.cell(hide_code=True)
-def _():
+def describe_ego_features():
     mo.md(r"""
     ### Features
 
@@ -93,7 +93,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _(DATA_PATH):
+def discover_ego_network_files(DATA_PATH):
     # Discover every ego-network source file recursively. Sorting makes file
     # processing and resulting row order reproducible across operating systems.
     TWITTER_EGO_FILES_PATH = DATA_PATH / "twitter"
@@ -107,7 +107,7 @@ def _(DATA_PATH):
 
 
 @app.cell(hide_code=True)
-def _(FEATNAMES_FILES, PARQUET_OUT_PATH):
+def load_feature_catalog(FEATNAMES_FILES, PARQUET_OUT_PATH):
     # Read either the global feature catalog or a legacy ego/index name map.
     # The save cell upgrades legacy metadata to the global catalog format.
     _cache_path = PARQUET_OUT_PATH / "feature_names.parquet"
@@ -146,7 +146,12 @@ def _(FEATNAMES_FILES, PARQUET_OUT_PATH):
 
 
 @app.cell(hide_code=True)
-def _(EGOFEAT_FILES, FEAT_FILES, PARQUET_OUT_PATH, TWITTER_EGO_FILES_PATH):
+def load_node_feature_vectors(
+    EGOFEAT_FILES,
+    FEAT_FILES,
+    PARQUET_OUT_PATH,
+    TWITTER_EGO_FILES_PATH,
+):
     # Source vectors are temporary inputs. The persistent node cache stores
     # global feature-ID lists instead of separate ego-specific binary vectors.
     _cache_path = PARQUET_OUT_PATH / "nodes.parquet"
@@ -208,7 +213,7 @@ def _(EGOFEAT_FILES, FEAT_FILES, PARQUET_OUT_PATH, TWITTER_EGO_FILES_PATH):
 
 
 @app.cell(hide_code=True)
-def _():
+def describe_parquet_caching():
     mo.md("""
     ## Save Data to Parquet
 
@@ -275,7 +280,11 @@ def cache_lazyframe_to_parquet(
 
 
 @app.cell(hide_code=True)
-def _(PARQUET_OUT_PATH, loaded_edges_lf, loaded_feats_lf):
+def cache_edges_and_feature_catalog(
+    PARQUET_OUT_PATH,
+    loaded_edges_lf,
+    loaded_feats_lf,
+):
     # Materialize each missing cache, then expose only Parquet-backed LazyFrames to
     # the rest of the notebook. The report makes cache state, row count, and disk
     # usage visible without collecting the full datasets into Python memory.
@@ -335,7 +344,7 @@ def _(PARQUET_OUT_PATH, loaded_edges_lf, loaded_feats_lf):
 
 
 @app.cell(hide_code=True)
-def _():
+def describe_consolidated_features():
     mo.md(r"""
     ### Consolidated Feature View
 
@@ -353,7 +362,11 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _(PARQUET_OUT_PATH, feats_lf, loaded_node_feature_vectors_lf):
+def consolidate_node_features(
+    PARQUET_OUT_PATH,
+    feats_lf,
+    loaded_node_feature_vectors_lf,
+):
     if loaded_node_feature_vectors_lf is None:
         node_feature_lists_lf = pl.scan_parquet(
             PARQUET_OUT_PATH / "nodes.parquet"
@@ -406,7 +419,7 @@ def _(PARQUET_OUT_PATH, feats_lf, loaded_node_feature_vectors_lf):
 
 
 @app.cell(hide_code=True)
-def _():
+def describe_node_relationships():
     mo.md(r"""
     ## Gather Node Data
 
@@ -427,7 +440,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _(
+def consolidate_and_cache_nodes(
     PARQUET_OUT_PATH,
     edges_lf,
     loaded_node_feature_vectors_lf,
@@ -1020,7 +1033,7 @@ def degree_analysis_inequality(
 
 
 @app.cell(hide_code=True)
-def _():
+def describe_ego_network_selection():
     mo.md(r"""
     ## Select Node to Analyze
 
@@ -1035,7 +1048,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _(nodes_lf):
+def select_ego_node(nodes_lf):
     # Materialize only the sorted node IDs needed as dropdown options. The selected
     # value is read in the next cell because marimo UI values cannot be consumed in
     # the same cell where the UI element is defined.
@@ -1052,7 +1065,7 @@ def _(nodes_lf):
 
 
 @app.cell(hide_code=True)
-def _(ego_node_dropdown, nodes_lf):
+def build_egocentric_network(ego_node_dropdown, nodes_lf):
     ego_node = ego_node_dropdown.value
     RELATIONSHIP_TYPES = ["followers", "following", "friends"]
 
