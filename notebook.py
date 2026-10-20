@@ -1033,6 +1033,579 @@ def degree_analysis_inequality(
 
 
 @app.cell(hide_code=True)
+def describe_components_and_reciprocity():
+    mo.md(r"""
+    ## 2. Components and reciprocity
+
+    A **weak component** connects nodes when edge direction is ignored. In a
+    **strong component**, every node can reach every other node along directed
+    paths. A singleton strong component can still have incoming or outgoing edges;
+    it is not necessarily isolated.
+
+    All consolidated nodes are included, even nodes absent from the edge list.
+    Self-loops are counted separately and excluded from the graph below, its
+    density, and all reciprocity measures. Here, an **isolate** has no relationship
+    to another node. Results describe this observed dataset.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def import_sparse_graph_tools():
+    import scipy.sparse as sparse
+    from scipy.sparse.csgraph import connected_components
+
+    return connected_components, sparse
+
+
+@app.cell(hide_code=True)
+def define_connectivity_analysis(connected_components):
+    def analyze_connectivity(adjacency, node_ids: np.ndarray) -> dict:
+        """Analyze a simple directed graph, keeping every node and excluding loops.
+
+        Component IDs are the smallest original node ID in each component.
+        Edge reciprocity counts both directions of each mutual pair; pair
+        reciprocity counts that pair once. Undefined ratios remain null.
+        """
+        node_ids = np.asarray(node_ids, dtype=np.int64)
+        size = node_ids.size
+        if adjacency.shape != (size, size) or np.unique(node_ids).size != size:
+            raise ValueError("Adjacency shape must match unique node IDs")
+        graph = adjacency.astype(bool).tocsr(copy=True)
+        graph.eliminate_zeros()
+        loops = int(np.count_nonzero(graph.diagonal()))
+        graph.setdiag(False)
+        graph.eliminate_zeros()
+        memberships = {"node": node_ids}
+        component_tables = []
+        component_summaries = []
+        for mode, label in [("weak", "Weak"), ("strong", "Strong")]:
+            component_count, labels = connected_components(
+                graph, directed=True, connection=mode, return_labels=True
+            )
+            sizes = np.bincount(labels, minlength=component_count)
+            anchors = np.full(component_count, np.iinfo(np.int64).max, dtype=np.int64)
+            np.minimum.at(anchors, labels, node_ids)
+            memberships[f"{mode}_component"] = anchors[labels]
+            table = (
+                pl.DataFrame(
+                    {
+                        "kind": [label] * component_count,
+                        "component": anchors,
+                        "nodes": sizes,
+                        "node_share": sizes / size if size else np.array([]),
+                    }
+                )
+                .sort(["nodes", "component"], descending=[True, False])
+                .with_row_index("rank", offset=1)
+            )
+            component_tables.append(table)
+            largest = int(sizes.max()) if component_count else 0
+            component_summaries.append(
+                {
+                    "kind": label,
+                    "components": component_count,
+                    "largest_nodes": largest,
+                    "largest_share": largest / size if size else None,
+                    "singleton_components": int(np.count_nonzero(sizes == 1)),
+                }
+            )
+        outgoing = np.diff(graph.indptr).astype(np.int64)
+        incoming = np.bincount(graph.indices, minlength=size).astype(np.int64)
+        mutual_graph = graph.multiply(graph.T).tocsr()
+        mutual = np.diff(mutual_graph.indptr).astype(np.int64)
+        edges = int(graph.nnz)
+        reciprocal_edges = int(mutual_graph.nnz)
+        mutual_pairs = reciprocal_edges // 2
+        one_way_pairs = edges - reciprocal_edges
+        connected_pairs = mutual_pairs + one_way_pairs
+        outgoing_rate = np.divide(
+            mutual, outgoing, out=np.full(size, np.nan), where=outgoing > 0
+        )
+        incoming_rate = np.divide(
+            mutual, incoming, out=np.full(size, np.nan), where=incoming > 0
+        )
+        totals = {
+            "nodes": size,
+            "self_loops": loops,
+            "edges": edges,
+            "isolates": int(np.count_nonzero((incoming + outgoing) == 0)),
+            "density": edges / (size * (size - 1)) if size > 1 else None,
+            "reciprocal_edges": reciprocal_edges,
+            "one_way_edges": one_way_pairs,
+            "mutual_pairs": mutual_pairs,
+            "one_way_pairs": one_way_pairs,
+            "connected_pairs": connected_pairs,
+            "edge_reciprocity": reciprocal_edges / edges if edges else None,
+            "pair_reciprocity": mutual_pairs / connected_pairs
+            if connected_pairs
+            else None,
+        }
+        return {
+            "adjacency": graph,
+            "memberships": pl.DataFrame(memberships),
+            "component_sizes": pl.concat(component_tables),
+            "component_summary": pl.DataFrame(component_summaries),
+            "totals": totals,
+            "node_reciprocity": pl.DataFrame(
+                {
+                    "node": node_ids,
+                    "incoming": incoming,
+                    "outgoing": outgoing,
+                    "mutual_neighbors": mutual,
+                    "outgoing_reciprocity": outgoing_rate,
+                    "incoming_reciprocity": incoming_rate,
+                }
+            ).fill_nan(None),
+        }
+
+    return (analyze_connectivity,)
+
+
+@app.cell(hide_code=True)
+def compute_components_and_reciprocity(
+    analyze_connectivity,
+    edges_lf,
+    nodes_lf,
+    sparse,
+):
+    # A sparse matrix stores only observed edges. The sorted ID mapping preserves
+    # feature-only nodes and makes component anchor IDs reproducible.
+    network_node_ids = nodes_lf.select("node").sort("node").collect()["node"].to_numpy()
+    mo.stop(
+        network_node_ids.size == 0,
+        mo.md("No nodes are available for connectivity analysis."),
+    )
+    _edges = edges_lf.select("from", "to").collect().to_numpy()
+    _source_indices = np.searchsorted(network_node_ids, _edges[:, 0])
+    _target_indices = np.searchsorted(network_node_ids, _edges[:, 1])
+    if (
+        np.any(_source_indices >= network_node_ids.size)
+        or np.any(_target_indices >= network_node_ids.size)
+        or not np.array_equal(network_node_ids[_source_indices], _edges[:, 0])
+        or not np.array_equal(network_node_ids[_target_indices], _edges[:, 1])
+    ):
+        raise ValueError(
+            "Every edge endpoint must be present in the consolidated node table"
+        )
+    _adjacency = sparse.csr_array(
+        (np.ones(_edges.shape[0], dtype=bool), (_source_indices, _target_indices)),
+        shape=(network_node_ids.size, network_node_ids.size),
+    )
+    connectivity_analysis = analyze_connectivity(_adjacency, network_node_ids)
+    network_adjacency = connectivity_analysis["adjacency"]
+    component_memberships = connectivity_analysis["memberships"]
+    component_sizes = connectivity_analysis["component_sizes"]
+    component_summary = connectivity_analysis["component_summary"]
+    network_structure_totals = connectivity_analysis["totals"]
+    node_reciprocity = connectivity_analysis["node_reciprocity"]
+
+    reciprocity_comparison = pl.DataFrame(
+        [
+            {
+                "basis": "Directed edges",
+                "numerator": network_structure_totals["reciprocal_edges"],
+                "denominator": network_structure_totals["edges"],
+                "share": network_structure_totals["edge_reciprocity"],
+            },
+            {
+                "basis": "Connected node pairs",
+                "numerator": network_structure_totals["mutual_pairs"],
+                "denominator": network_structure_totals["connected_pairs"],
+                "share": network_structure_totals["pair_reciprocity"],
+            },
+        ]
+    )
+    _rate_summaries = []
+    _histograms = []
+    for _direction in ["outgoing", "incoming"]:
+        _values = node_reciprocity[f"{_direction}_reciprocity"].drop_nulls().to_numpy()
+        _counts, _bins = np.histogram(_values, bins=np.linspace(0, 1, 21))
+        _histograms.append(
+            pl.DataFrame(
+                {
+                    "direction": [_direction.title()] * _counts.size,
+                    "lower": _bins[:-1],
+                    "upper": _bins[1:],
+                    "nodes": _counts,
+                }
+            )
+        )
+        _rate_summaries.append(
+            {
+                "direction": _direction.title(),
+                "defined_nodes": _values.size,
+                "undefined_nodes": network_node_ids.size - _values.size,
+                "mean": float(_values.mean()) if _values.size else None,
+                "median": float(np.median(_values)) if _values.size else None,
+                "zero_rate_nodes": int(np.count_nonzero(_values == 0)),
+                "fully_reciprocated_nodes": int(np.count_nonzero(_values == 1)),
+            }
+        )
+    node_reciprocity_summary = pl.DataFrame(_rate_summaries)
+    node_reciprocity_histogram = pl.concat(_histograms)
+    return (
+        component_memberships,
+        component_sizes,
+        component_summary,
+        network_structure_totals,
+        node_reciprocity,
+        node_reciprocity_histogram,
+        node_reciprocity_summary,
+        reciprocity_comparison,
+    )
+
+
+@app.cell(hide_code=True)
+def display_component_overview(component_summary, network_structure_totals):
+    _weak = component_summary.filter(pl.col("kind") == "Weak").row(0, named=True)
+    _strong = component_summary.filter(pl.col("kind") == "Strong").row(0, named=True)
+    mo.vstack(
+        [
+            mo.hstack(
+                [
+                    mo.stat(f"{_weak['components']:,}", label="Weak components"),
+                    mo.stat(f"{_strong['components']:,}", label="Strong components"),
+                    mo.stat(
+                        f"{_strong['largest_share']:.1%}",
+                        label="Nodes in largest strong component",
+                        caption=f"{_strong['largest_nodes']:,} of {network_structure_totals['nodes']:,} nodes",
+                    ),
+                    mo.stat(
+                        f"{network_structure_totals['isolates']:,}",
+                        label="Isolates",
+                        caption="No non-self incoming or outgoing edges",
+                    ),
+                ],
+                widths="equal",
+                wrap=True,
+            ),
+            mo.ui.table(
+                component_summary,
+                selection=None,
+                pagination=False,
+                show_column_summaries=False,
+                show_data_types=False,
+                format_mapping={
+                    "components": "{:,}",
+                    "largest_nodes": "{:,}",
+                    "largest_share": "{:.2%}",
+                    "singleton_components": "{:,}",
+                },
+            ),
+            mo.md(
+                f"The graph has **{network_structure_totals['edges']:,} non-self directed edges** and **{network_structure_totals['self_loops']:,} self-loops**, which are excluded here. Directed density is **{network_structure_totals['density']:.6%}**, using n(n−1) possible non-self edges."
+            ),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def select_component_connectivity():
+    component_type_selector = mo.ui.dropdown(
+        options=["Weak", "Strong"],
+        value="Strong",
+        label="Component definition",
+    )
+    component_type_selector
+    return (component_type_selector,)
+
+
+@app.cell(hide_code=True)
+def display_component_size_distributions(
+    component_memberships,
+    component_sizes,
+    component_type_selector,
+):
+    _kind = component_type_selector.value
+    _components = component_sizes.filter(pl.col("kind") == _kind)
+    _largest = _components.head(10)
+    _frequency = _components.group_by("nodes").len(name="components").sort("nodes")
+    component_rank_chart = (
+        alt.Chart(_largest)
+        .mark_circle(color="#2563a6", size=80)
+        .encode(
+            x=alt.X(
+                "nodes:Q",
+                title="Nodes per component (log scale)",
+                scale=alt.Scale(type="log"),
+                axis=alt.Axis(format="~s", tickCount=5),
+            ),
+            y=alt.Y("rank:O", title="Component rank", sort="ascending"),
+            tooltip=[
+                alt.Tooltip("rank:O", title="Rank"),
+                alt.Tooltip("component:Q", title="Smallest node ID", format="d"),
+                alt.Tooltip("nodes:Q", title="Nodes", format=",d"),
+                alt.Tooltip("node_share:Q", title="Share of all nodes", format=".3%"),
+            ],
+        )
+        .properties(
+            title=f"Largest {_kind.lower()} components (up to 10)",
+            width="container",
+            height=280,
+        )
+    )
+    component_size_chart = (
+        alt.Chart(_frequency)
+        .mark_circle(color="#2563a6", size=75)
+        .encode(
+            x=alt.X(
+                "nodes:Q",
+                title="Nodes in a component (log scale)",
+                scale=alt.Scale(type="log"),
+                axis=alt.Axis(format="~s", tickCount=5),
+            ),
+            y=alt.Y(
+                "components:Q",
+                title="Number of components (log scale)",
+                scale=alt.Scale(type="log"),
+                axis=alt.Axis(format="~s", tickCount=5),
+            ),
+            tooltip=[
+                alt.Tooltip("nodes:Q", title="Component size", format=",d"),
+                alt.Tooltip(
+                    "components:Q", title="Components of this size", format=",d"
+                ),
+            ],
+        )
+        .properties(
+            title=f"Exact {_kind.lower()} component-size frequencies",
+            width="container",
+            height=300,
+        )
+    )
+    mo.vstack(
+        [
+            mo.ui.altair_chart(
+                component_rank_chart, chart_selection=False, legend_selection=False
+            ),
+            mo.ui.altair_chart(
+                component_size_chart, chart_selection=False, legend_selection=False
+            ),
+            mo.md(
+                "Each dot represents an exact component size, not a histogram bin. A single component appears as one dot. Component IDs are their smallest original node ID; ranks sort by size, then ID."
+            ),
+            mo.accordion(
+                {
+                    "Component catalog": mo.ui.table(
+                        _components,
+                        selection=None,
+                        pagination=True,
+                        page_size=10,
+                        show_data_types=False,
+                        format_mapping={"node_share": "{:.3%}"},
+                    ),
+                    "Node-to-component memberships": mo.ui.table(
+                        component_memberships,
+                        selection=None,
+                        pagination=True,
+                        page_size=10,
+                        show_data_types=False,
+                    ),
+                }
+            ),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def display_global_reciprocity(
+    network_structure_totals,
+    reciprocity_comparison,
+):
+    _totals = network_structure_totals
+    _edge_rate = (
+        f"{_totals['edge_reciprocity']:.2%}"
+        if _totals["edge_reciprocity"] is not None
+        else "Undefined"
+    )
+    _pair_rate = (
+        f"{_totals['pair_reciprocity']:.2%}"
+        if _totals["pair_reciprocity"] is not None
+        else "Undefined"
+    )
+    _bars = (
+        alt.Chart(reciprocity_comparison)
+        .mark_bar(color="#2563a6")
+        .encode(
+            x=alt.X(
+                "share:Q",
+                title="Reciprocity within each denominator",
+                scale=alt.Scale(domain=[0, 1]),
+                axis=alt.Axis(format=".0%", tickCount=5),
+            ),
+            y=alt.Y(
+                "basis:N", title=None, sort=["Directed edges", "Connected node pairs"]
+            ),
+            tooltip=[
+                alt.Tooltip("basis:N", title="Denominator basis"),
+                alt.Tooltip("numerator:Q", title="Reciprocated count", format=",d"),
+                alt.Tooltip("denominator:Q", title="Total count", format=",d"),
+                alt.Tooltip("share:Q", title="Reciprocity", format=".2%"),
+            ],
+        )
+    )
+    global_reciprocity_chart = (
+        _bars
+        + _bars.mark_text(align="left", dx=5, color="#333333").encode(
+            text=alt.Text("share:Q", format=".1%")
+        )
+    ).properties(
+        title="Reciprocity by counting unit",
+        width="container",
+        height=150,
+    )
+    mo.vstack(
+        [
+            mo.md("### Reciprocity across the network"),
+            mo.hstack(
+                [
+                    mo.stat(
+                        _edge_rate,
+                        label="Directed-edge reciprocity",
+                        caption=f"{_totals['reciprocal_edges']:,} / {_totals['edges']:,} directed edges",
+                    ),
+                    mo.stat(
+                        _pair_rate,
+                        label="Connected-pair reciprocity",
+                        caption=f"{_totals['mutual_pairs']:,} / {_totals['connected_pairs']:,} connected pairs",
+                    ),
+                ],
+                widths="equal",
+                wrap=True,
+            ),
+            mo.md(
+                f"There are **{_totals['mutual_pairs']:,} mutual pairs** and **{_totals['one_way_pairs']:,} one-way pairs**. If R is the mutual-pair count and U the one-way-pair count, directed-edge reciprocity is **2R / (2R + U)**, while connected-pair reciprocity is **R / (R + U)**. Pairs with no edge are outside both denominators. These rates are different views of the same relationships, not independent results."
+            ),
+            mo.ui.altair_chart(
+                global_reciprocity_chart, chart_selection=False, legend_selection=False
+            ),
+            mo.accordion(
+                {
+                    "Exact numerators and denominators": mo.ui.table(
+                        reciprocity_comparison,
+                        selection=None,
+                        pagination=False,
+                        show_data_types=False,
+                        show_column_summaries=False,
+                        format_mapping={
+                            "numerator": "{:,}",
+                            "denominator": "{:,}",
+                            "share": "{:.4%}",
+                        },
+                    )
+                }
+            ),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def display_node_reciprocity_distributions(
+    node_reciprocity,
+    node_reciprocity_histogram,
+    node_reciprocity_summary,
+):
+    _tabs = {}
+    node_reciprocity_charts = {}
+    for _direction in ["Outgoing", "Incoming"]:
+        _summary = node_reciprocity_summary.filter(
+            pl.col("direction") == _direction
+        ).row(0, named=True)
+        _histogram = node_reciprocity_histogram.filter(
+            pl.col("direction") == _direction
+        )
+        _chart = (
+            alt.Chart(_histogram)
+            .mark_bar(color="#2563a6", binSpacing=0)
+            .encode(
+                x=alt.X(
+                    "lower:Q",
+                    bin="binned",
+                    title=f"{_direction} reciprocity per node",
+                    scale=alt.Scale(domain=[0, 1]),
+                    axis=alt.Axis(format=".0%", tickCount=5),
+                ),
+                x2="upper:Q",
+                y=alt.Y(
+                    "nodes:Q",
+                    title="Nodes with a defined rate",
+                    scale=alt.Scale(zero=True),
+                ),
+                tooltip=[
+                    alt.Tooltip("lower:Q", title="From (inclusive)", format=".0%"),
+                    alt.Tooltip(
+                        "upper:Q", title="To (exclusive, except 100%)", format=".0%"
+                    ),
+                    alt.Tooltip("nodes:Q", title="Nodes", format=",d"),
+                ],
+            )
+            .properties(
+                title=f"{_direction} reciprocity distribution",
+                width="container",
+                height=300,
+            )
+        )
+        node_reciprocity_charts[_direction] = _chart
+        _tabs[_direction] = mo.vstack(
+            [
+                mo.md(
+                    f"**{_summary['defined_nodes']:,} nodes** have a defined rate; **{_summary['undefined_nodes']:,}** have no {_direction.lower()} edges and are excluded from this histogram, not assigned zero. Bins have width 5 percentage points; the final bin includes 100%."
+                ),
+                mo.ui.altair_chart(
+                    _chart, chart_selection=False, legend_selection=False
+                ),
+            ]
+        )
+    mo.vstack(
+        [
+            mo.md("### Reciprocity for individual nodes"),
+            mo.md(
+                "**Outgoing reciprocity** is mutual neighbors / accounts followed: how many followed accounts follow back. **Incoming reciprocity** is mutual neighbors / followers: how many followers the account follows back. All counts here exclude self-loops. The mean below gives each eligible node equal weight; it is not global directed-edge reciprocity."
+            ),
+            mo.ui.table(
+                node_reciprocity_summary,
+                selection=None,
+                pagination=False,
+                show_column_summaries=False,
+                show_data_types=False,
+                format_mapping={
+                    "mean": "{:.2%}",
+                    "median": "{:.2%}",
+                    "defined_nodes": "{:,}",
+                    "undefined_nodes": "{:,}",
+                    "zero_rate_nodes": "{:,}",
+                    "fully_reciprocated_nodes": "{:,}",
+                },
+            ),
+            mo.ui.tabs(_tabs),
+            mo.accordion(
+                {
+                    "Per-node reciprocity data": mo.ui.table(
+                        node_reciprocity,
+                        selection=None,
+                        pagination=True,
+                        page_size=10,
+                        show_data_types=False,
+                        format_mapping={
+                            "outgoing_reciprocity": "{:.2%}",
+                            "incoming_reciprocity": "{:.2%}",
+                        },
+                    )
+                }
+            ),
+            mo.md(
+                "Methods: [SciPy connected components](https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csgraph.connected_components.html). The sparse adjacency, component memberships, and per-node reciprocity table are retained for subsequent notebook analyses."
+            ),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
 def describe_ego_network_selection():
     mo.md(r"""
     ## Select Node to Analyze
