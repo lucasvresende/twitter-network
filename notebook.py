@@ -525,7 +525,7 @@ def consolidate_and_cache_nodes(
     return (nodes_lf,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def degree_analysis_intro():
     mo.md(r"""
     ## 1. Degree distributions and connection inequality
@@ -542,7 +542,7 @@ def degree_analysis_intro():
     return
 
 
-@app.function
+@app.function(hide_code=True)
 def compute_degree_profile(values: np.ndarray) -> dict:
     """Summarize nonnegative integer counts, retaining zero-degree nodes.
 
@@ -629,7 +629,7 @@ def compute_degree_profile(values: np.ndarray) -> dict:
     }
 
 
-@app.cell
+@app.cell(hide_code=True)
 def degree_analysis_data(nodes_lf):
     # Collect only scalar counts; relationship and feature lists stay in Parquet.
     degree_counts = nodes_lf.select(
@@ -669,7 +669,7 @@ def degree_analysis_data(nodes_lf):
     )
 
 
-@app.cell
+@app.cell(hide_code=True)
 def degree_analysis_summary(degree_counts, degree_summary):
     mo.vstack(
         [
@@ -707,7 +707,7 @@ def degree_analysis_summary(degree_counts, degree_summary):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def degree_analysis_selector(degree_metrics):
     degree_metric_selector = mo.ui.dropdown(
         options=list(degree_metrics),
@@ -718,7 +718,7 @@ def degree_analysis_selector(degree_metrics):
     return (degree_metric_selector,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def degree_analysis_selection(degree_metric_selector, degree_profiles):
     selected_degree_metric = degree_metric_selector.value
     selected_degree_profile = degree_profiles[selected_degree_metric]
@@ -730,7 +730,7 @@ def degree_analysis_selection(degree_metric_selector, degree_profiles):
     )
 
 
-@app.cell
+@app.cell(hide_code=True)
 def degree_analysis_distributions(
     selected_degree_metric,
     selected_degree_profile,
@@ -877,7 +877,7 @@ def degree_analysis_distributions(
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def degree_analysis_inequality(
     degree_summary,
     degree_top_shares,
