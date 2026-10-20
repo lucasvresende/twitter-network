@@ -1,0 +1,8 @@
+{
+  "name": "twitter-network-codex-agent",
+  "private": true,
+  "dependencies": {
+    "@agentclientprotocol/codex-acp": "2.2.2",
+    "stdio-to-ws": "0.2.0"
+  }
+}

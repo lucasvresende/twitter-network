@@ -1,13 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Use the current ACP adapter installed by Zed. Marimo's bundled launch hint
-# selects the older @zed-industries adapter, which rejects current models.
-adapter="${MARIMO_CODEX_ADAPTER:-$HOME/.local/share/zed/external_agents/registry/npx/codex-acp/node_modules/@agentclientprotocol/codex-acp/dist/index.js}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd -- "$script_dir/.."
+
+for dependency in node npm; do
+    command -v "$dependency" >/dev/null || {
+        printf 'Required command not found: %s\n' "$dependency" >&2
+        exit 1
+    }
+done
+
+# Marimo 0.25's launch hint uses the older @zed-industries adapter, which
+# rejects current models. Install locked, project-local tools instead of
+# depending on Zed's private installation or resolving npx packages each run.
+adapter="${MARIMO_CODEX_ADAPTER:-$script_dir/node_modules/@agentclientprotocol/codex-acp/dist/index.js}"
+bridge="$script_dir/node_modules/stdio-to-ws/dist/main.js"
+if [[ ! -f "$adapter" || ! -f "$bridge" ]]; then
+    npm ci --prefix "$script_dir" --no-audit --no-fund
+fi
 if [[ ! -f "$adapter" ]]; then
-    printf 'Current Codex ACP adapter not found: %s\nSet MARIMO_CODEX_ADAPTER to its index.js path.\n' "$adapter" >&2
+    printf 'Codex ACP adapter not found: %s\n' "$adapter" >&2
     exit 1
 fi
 
-export CODEX_PATH="${CODEX_PATH:-$(command -v codex)}"
-exec npx --yes stdio-to-ws "node \"$adapter\"" --port 3021 --cors http://localhost:2718
+# Keep the adapter's compatible bundled Codex unless explicitly overridden.
+printf 'Starting Codex ACP bridge at ws://localhost:3021/message\n'
+exec node "$bridge" "node \"$adapter\"" --port 3021

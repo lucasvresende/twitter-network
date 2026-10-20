@@ -219,3 +219,6 @@ __marimo__/
 
 # Data
 data/
+
+# Local Codex ACP tools
+scripts/node_modules/
