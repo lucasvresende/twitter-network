@@ -33,7 +33,7 @@ Keep it running, select **Codex** in the notebook's agent panel, and connect.
 If asked, sign in with your ChatGPT account. For the notebook itself, run:
 
 ```sh
-cd /home/lvr/projects/development/twitter-network && uv run marimo edit notebook.py --port 2718
+cd /home/lvr/projects/development/twitter-network && uv run marimo edit notebook.py --watch --port 2718
 ```
 
 Use this bridge launcher instead of marimo 0.25's suggested

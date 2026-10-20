@@ -89,8 +89,8 @@ def _():
     - `.circles` and `.edges` are discovered for possible later analysis but are
       not transformed in this section.
 
-    Feature indices are local to an ego network, so `ego_node` is retained as part
-    of every feature key.
+    Features are identified globally by name. Local ego/index pairs are retained
+    only as provenance so each source vector can be mapped to global feature IDs.
     """)
     return
 
@@ -111,9 +111,8 @@ def _(DATA_PATH):
 
 @app.cell(hide_code=True)
 def _(FEATNAMES_FILES, PARQUET_OUT_PATH):
-    # Produce one metadata row per ego-specific feature index:
-    # (ego_node, index, name). Feature indices cannot be joined across ego networks
-    # without including ego_node because each .featnames file defines its own map.
+    # Read either the global feature catalog or a legacy ego/index name map.
+    # The save cell upgrades legacy metadata to the global catalog format.
     _cache_path = PARQUET_OUT_PATH / "feature_names.parquet"
     if _cache_path.is_file():
         loaded_feats_lf = pl.scan_parquet(_cache_path)
@@ -151,12 +150,18 @@ def _(FEATNAMES_FILES, PARQUET_OUT_PATH):
 
 @app.cell(hide_code=True)
 def _(EGOFEAT_FILES, FEAT_FILES, PARQUET_OUT_PATH, TWITTER_EGO_FILES_PATH):
-    # Normalize .feat and .egofeat records to one row per node:
-    # (ego_node, node, is_ego, features). Keeping features as List[Int8] supports
-    # different vector lengths across ego networks without creating sparse columns.
-    _cache_path = PARQUET_OUT_PATH / "node_feature_vectors.parquet"
-    if _cache_path.is_file():
-        loaded_node_feature_vectors_lf = pl.scan_parquet(_cache_path)
+    # Source vectors are temporary inputs. The persistent node cache stores
+    # global feature-ID lists instead of separate ego-specific binary vectors.
+    _cache_path = PARQUET_OUT_PATH / "nodes.parquet"
+    _catalog_path = PARQUET_OUT_PATH / "feature_names.parquet"
+    if (
+        _cache_path.is_file()
+        and _catalog_path.is_file()
+        and pl.scan_parquet(_cache_path).collect_schema().get("features")
+        == pl.List(pl.Int64)
+        and "sources" in pl.scan_parquet(_catalog_path).collect_schema()
+    ):
+        loaded_node_feature_vectors_lf = None
     else:
         _feature_paths = sorted([*FEAT_FILES, *EGOFEAT_FILES])
         if not _feature_paths:
@@ -212,26 +217,32 @@ def _():
 
     This section converts the normalized lazy datasets into reusable Parquet
     caches under **`data/out`**. Missing caches are written with Zstandard
-    compression; existing files are reused without being rewritten. Downstream
-    cells always receive a fresh lazy scan of the Parquet file, so the application
+    compression; existing files are reused unless their schema needs an upgrade.
+    Downstream cells receive a lazy scan of the Parquet file, so the application
     benefits from predicate and column pushdown.
 
     Cached datasets:
 
     - `edges.parquet`: deduplicated and sorted directed edges
-    - `feature_names.parquet`: feature descriptions keyed by ego and index
-    - `node_feature_vectors.parquet`: binary feature lists for alters and egos
+    - `feature_names.parquet`: one row per distinct feature name, with a unique
+      integer `id` and `sources`, a list of `{ego_node, index}` structs. IDs start
+      at 0 in alphabetical name order.
+    - `nodes.parquet`: relationship lists and a sorted `features` list of global
+      feature IDs per node, saved in **Gather Node Data** below. A feature is
+      included if it is active in any source network, including ego records.
+      Nodes without observed active features have an empty list.
 
-    The expanded long-form feature table is intentionally not cached because it
-    would duplicate the compact list representation.
+    Source binary vectors are read only when building or upgrading the node
+    cache; a separate vector cache is no longer used.
 
     > To rebuild after changing source files or preprocessing logic, delete the
-    > affected file from `data/out` and rerun the loading section.
+    > affected file from `data/out` and rerun the loading section. When rebuilding
+    > the feature catalog, also delete `nodes.parquet` so its IDs stay aligned.
     """)
     return
 
 
-@app.function(hide_code=True)
+@app.function
 def cache_lazyframe_to_parquet(
     frame: pl.LazyFrame,
     path: Path,
@@ -267,12 +278,7 @@ def cache_lazyframe_to_parquet(
 
 
 @app.cell(hide_code=True)
-def _(
-    PARQUET_OUT_PATH,
-    loaded_edges_lf,
-    loaded_feats_lf,
-    loaded_node_feature_vectors_lf,
-):
+def _(PARQUET_OUT_PATH, loaded_edges_lf, loaded_feats_lf):
     # Materialize each missing cache, then expose only Parquet-backed LazyFrames to
     # the rest of the notebook. The report makes cache state, row count, and disk
     # usage visible without collecting the full datasets into Python memory.
@@ -280,20 +286,55 @@ def _(
         loaded_edges_lf,
         PARQUET_OUT_PATH / "edges.parquet",
     )
+    _features_path = PARQUET_OUT_PATH / "feature_names.parquet"
+    _features_schema = loaded_feats_lf.collect_schema()
+    _features_need_upgrade = "sources" not in _features_schema
+    if _features_need_upgrade:
+        _feature_origins = loaded_feats_lf.select("name", "ego_node", "index")
+        if (
+            _feature_origins.select(pl.any_horizontal(pl.all().is_null()).any())
+            .collect()
+            .item()
+        ):
+            raise ValueError("Feature names and source ego/index pairs cannot be null")
+        if (
+            _feature_origins.group_by("ego_node", "index")
+            .agg(pl.col("name").n_unique().alias("names"))
+            .filter(pl.col("names") > 1)
+            .select(pl.len())
+            .collect()
+            .item()
+        ):
+            raise ValueError(
+                "Each source ego/index pair must identify one feature name"
+            )
+        _features_to_cache = (
+            _feature_origins.unique()
+            .sort(["name", "ego_node", "index"])
+            .group_by("name", maintain_order=True)
+            .agg(pl.struct("ego_node", "index").alias("sources"))
+            .sort("name")
+            .with_row_index("id")
+            .with_columns(pl.col("id").cast(pl.Int64))
+            .select("id", "name", "sources")
+        )
+    else:
+        _features_to_cache = loaded_feats_lf
+    if _features_need_upgrade and _features_path.is_file():
+        # Replace the old cache only after its upgraded copy is complete.
+        with TemporaryDirectory(
+            prefix=".parquet-", dir=_features_path.parent
+        ) as _features_temp_dir:
+            _features_temp_path = Path(_features_temp_dir) / _features_path.name
+            cache_lazyframe_to_parquet(_features_to_cache, _features_temp_path)
+            _features_temp_path.replace(_features_path)
     feats_lf, _feats_cache_report = cache_lazyframe_to_parquet(
-        loaded_feats_lf,
-        PARQUET_OUT_PATH / "feature_names.parquet",
+        _features_to_cache,
+        _features_path,
     )
-    node_feature_vectors_lf, _vectors_cache_report = cache_lazyframe_to_parquet(
-        loaded_node_feature_vectors_lf,
-        PARQUET_OUT_PATH / "node_feature_vectors.parquet",
-    )
-
-    parquet_cache_report = pl.DataFrame(
-        [_edges_cache_report, _feats_cache_report, _vectors_cache_report]
-    )
+    parquet_cache_report = pl.DataFrame([_edges_cache_report, _feats_cache_report])
     mo.ui.table(parquet_cache_report, selection=None)
-    return edges_lf, feats_lf, node_feature_vectors_lf
+    return edges_lf, feats_lf
 
 
 @app.cell(hide_code=True)
@@ -301,42 +342,70 @@ def _():
     mo.md(r"""
     ### Consolidated Feature View
 
-    The cached `node_feature_vectors_lf` keeps one compact binary list per node.
-    For analysis that needs individual features, the next cell derives
-    `node_features_lf` with one row per feature value and joins each local index to
-    its description.
+    `feats_lf` is the unique global feature catalog. Its `sources` list records
+    the local indices used to decode source vectors. `node_feature_lists_lf`
+    merges active features across every observation of a node, keeping one sorted
+    list of unique feature IDs per node. A zero in one observation does not remove
+    a feature observed as active elsewhere. Nodes with no active features remain
+    present with an empty list.
 
-    Because this expanded view can be large, keep it lazy and filter by
-    `ego_node`, `node`, or `value` before calling `collect()`. The displayed table
-    below shows the compact vector dataset, not the expanded long-form result.
+    These compact lists are saved directly in `nodes.parquet` below. The displayed
+    table shows the global feature catalog with its provenance.
     """)
     return
 
 
-@app.cell(hide_code=True)
-def _(feats_lf, node_feature_vectors_lf):
-    # Expand each binary vector into rows keyed by its zero-based feature index,
-    # then attach the ego-specific feature description. This remains lazy; filters
-    # applied downstream can be pushed into the Parquet scans where possible.
-    node_features_lf = (
-        node_feature_vectors_lf.with_columns(
-            pl.int_ranges(
-                0,
-                pl.col("features").list.len(),
-                dtype=pl.Int64,
-            ).alias("index"),
+@app.cell
+def _(PARQUET_OUT_PATH, feats_lf, loaded_node_feature_vectors_lf):
+    if loaded_node_feature_vectors_lf is None:
+        node_feature_lists_lf = pl.scan_parquet(
+            PARQUET_OUT_PATH / "nodes.parquet"
+        ).select("node", "features")
+    else:
+        _feature_lookup = (
+            feats_lf.select("id", "sources")
+            .explode("sources")
+            .unnest("sources")
+            .rename({"id": "feature_id"})
         )
-        .explode("index", "features")
-        .rename({"features": "value"})
-        .join(feats_lf, on=["ego_node", "index"], how="left")
-        .select("ego_node", "node", "is_ego", "index", "name", "value")
-        .sort(["ego_node", "node"])
-    )
-
-    # Display the compact cached representation to avoid rendering the much larger
-    # exploded table by default.
-    mo.ui.table(node_feature_vectors_lf)
-    return
+        _active_features = (
+            loaded_node_feature_vectors_lf.select(
+                "node",
+                "ego_node",
+                pl.col("features")
+                .list.eval(pl.arg_where(pl.element() == 1))
+                .cast(pl.List(pl.Int64))
+                .alias("index"),
+            )
+            .explode("index")
+            .filter(pl.col("index").is_not_null())
+            .join(_feature_lookup, on=["ego_node", "index"], how="left", validate="m:1")
+        )
+        if (
+            _active_features.select(pl.col("feature_id").is_null().any())
+            .collect()
+            .item()
+        ):
+            raise ValueError(
+                "An active source feature is missing from the feature catalog"
+            )
+        node_feature_lists_lf = (
+            loaded_node_feature_vectors_lf.select("node")
+            .unique()
+            .join(
+                _active_features.group_by("node").agg(
+                    pl.col("feature_id").unique().sort().alias("features")
+                ),
+                on="node",
+                how="left",
+            )
+            .with_columns(
+                pl.col("features").fill_null(pl.lit([], dtype=pl.List(pl.Int64)))
+            )
+            .sort("node")
+        )
+    mo.ui.table(feats_lf)
+    return (node_feature_lists_lf,)
 
 
 @app.cell(hide_code=True)
@@ -350,16 +419,23 @@ def _():
     - **followers**: nodes with an edge pointing to this node
     - **following**: nodes this node points to
     - **friends**: the intersection of followers and following (mutual edges)
+    - **features**: sorted global feature IDs observed across all ego networks
 
     Both the member lists and their counts are retained. Nodes appearing on only
     one side of an edge are preserved by a full join, and missing lists/counts are
-    replaced with empty lists and zeros.
+    replaced with empty lists and zeros. Nodes found only in feature files are
+    included too. The resulting table is cached in `data/out/nodes.parquet`.
     """)
     return
 
 
 @app.cell(hide_code=True)
-def _(edges_lf):
+def _(
+    PARQUET_OUT_PATH,
+    edges_lf,
+    loaded_node_feature_vectors_lf,
+    node_feature_lists_lf,
+):
     # Aggregate incoming edges to obtain each node's followers.
     _followers_lf = (
         edges_lf.group_by("to")
@@ -382,7 +458,7 @@ def _(edges_lf):
 
     # Combine both directions and identify mutual relationships. The full join
     # preserves nodes that have only incoming or only outgoing edges.
-    nodes_lf = (
+    _relationships_lf = (
         _followers_lf.join(
             _following_lf,
             on="node",
@@ -405,6 +481,36 @@ def _(edges_lf):
         )
     )
 
+    _nodes_path = PARQUET_OUT_PATH / "nodes.parquet"
+    if loaded_node_feature_vectors_lf is None:
+        nodes_lf = pl.scan_parquet(_nodes_path)
+    else:
+        _nodes_to_cache = (
+            _relationships_lf.join(
+                node_feature_lists_lf, on="node", how="full", coalesce=True
+            )
+            .with_columns(
+                pl.col("followers_count", "following_count", "friends_count").fill_null(
+                    0
+                ),
+                pl.col("followers", "following", "friends", "features").fill_null(
+                    pl.lit([], dtype=pl.List(pl.Int64))
+                ),
+            )
+            .sort("node")
+        )
+        if _nodes_path.is_file():
+            with TemporaryDirectory(
+                prefix=".parquet-", dir=_nodes_path.parent
+            ) as _nodes_temp_dir:
+                _nodes_temp_path = Path(_nodes_temp_dir) / _nodes_path.name
+                cache_lazyframe_to_parquet(_nodes_to_cache, _nodes_temp_path)
+                _nodes_temp_path.replace(_nodes_path)
+        nodes_lf, _nodes_cache_report = cache_lazyframe_to_parquet(
+            _nodes_to_cache, _nodes_path
+        )
+    # The consolidated node cache now contains all persisted feature lists.
+    (PARQUET_OUT_PATH / "node_feature_vectors.parquet").unlink(missing_ok=True)
     mo.ui.table(nodes_lf)
     return (nodes_lf,)
 
@@ -470,6 +576,7 @@ def _(ego_node_dropdown, nodes_lf):
         )
         .select(
             "node",
+            "features",
             *[
                 pl.col([f"{rel}_count", f"{rel}", f"alter_{rel}_count", f"alter_{rel}"])
                 for rel in RELATIONSHIP_TYPES
