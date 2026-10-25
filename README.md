@@ -19,10 +19,23 @@ This creates `data/twitter_combined.txt` and extracts the `.featnames`, `.feat`,
 `.egofeat`, `.circles`, and `.edges` files into `data/twitter/`. The notebook
 creates its Parquet caches in `data/out/` on the first run.
 
-Then open the notebook with `uv run marimo edit notebook.py`.
 The `data/` directory is excluded from Git.
 
-To use Codex in marimo's agent panel, start the bridge in a separate terminal
+To open marimo with the Codex bridge in one terminal, run from the project root
+(requires `uv`, Node.js, npm, and Linux's `setsid`):
+
+```sh
+bash scripts/start-marimo.sh
+```
+
+This opens the notebook at `http://localhost:2718/` and starts the project-local
+Codex bridge. Select **Codex** in the agent panel and connect; sign in if asked.
+Press **Ctrl+C** to stop both services. Stop any existing marimo server on port
+2718 or bridge on port 3021 before using this launcher.
+
+To run the services separately, open the notebook with
+`uv run marimo edit notebook.py --watch --port 2718 --no-token` and start the
+bridge in another terminal
 (requires Node.js and npm; installs the locked dependencies on first use):
 
 ```sh

@@ -2,7 +2,7 @@
 
 import marimo
 
-__generated_with = "0.25.1"
+__generated_with = "0.25.2"
 app = marimo.App(width="medium", auto_download=["html"], sql_output="native")
 
 with app.setup:
@@ -17,6 +17,8 @@ with app.setup:
 
 @app.cell(hide_code=True)
 def resolve_data_paths():
+    import networkx as nx
+
     # Resolve every data location relative to this notebook so it can be run
     # from any working directory.
     ROOT_PATH = Path(__file__).resolve().parent
@@ -24,7 +26,7 @@ def resolve_data_paths():
     DATA_PATH = ROOT_PATH / "data"
     TWITTER_COMBINED_TXT_PATH = DATA_PATH / "twitter_combined.txt"
     PARQUET_OUT_PATH = DATA_PATH / "out"
-    return DATA_PATH, PARQUET_OUT_PATH, TWITTER_COMBINED_TXT_PATH
+    return DATA_PATH, PARQUET_OUT_PATH, TWITTER_COMBINED_TXT_PATH, nx
 
 
 @app.cell(hide_code=True)
@@ -414,7 +416,7 @@ def consolidate_node_features(
             )
             .sort("node")
         )
-    mo.ui.table(feats_lf)
+    mo.ui.table(feats_lf, selection=None)
     return (node_feature_lists_lf,)
 
 
@@ -521,7 +523,7 @@ def consolidate_and_cache_nodes(
         )
     # The consolidated node cache now contains all persisted feature lists.
     (PARQUET_OUT_PATH / "node_feature_vectors.parquet").unlink(missing_ok=True)
-    mo.ui.table(nodes_lf)
+    mo.ui.table(nodes_lf, selection=None)
     return (nodes_lf,)
 
 
@@ -1937,8 +1939,10 @@ def describe_ego_network_selection():
     ## Select Node to Analyze
 
     Choose an ego node to construct a reactive egocentric network. Changing the
-    dropdown reruns only the dependent cells. This notebook defines the network as
-    the selected ego plus every account the ego follows.
+    dropdown reruns only the dependent cells. The table below contains the selected
+    ego plus every account the ego follows. The network plot has its own relationship
+    selector: **Following (outgoing)**, **Followers (incoming)**, **Friends (mutual)**,
+    or **All** incoming and outgoing neighbors.
 
     The resulting table retains each node's global relationship lists and adds
     `alter_*` columns restricted to members of this selected network.
@@ -1958,9 +1962,36 @@ def select_ego_node(nodes_lf):
         value=ego_nodes[0],
         label="Choose an ego node",
     )
-
-    ego_node_dropdown
     return (ego_node_dropdown,)
+
+
+@app.cell(hide_code=True)
+def control_ego_network_visualization(
+    ego_network_feature,
+    ego_network_labels,
+    ego_network_neighbor_edges,
+    ego_network_node_limit,
+    ego_network_relationship,
+    ego_node_dropdown,
+):
+    mo.vstack(
+        [
+            mo.md("### Network controls"),
+            mo.hstack(
+                [ego_node_dropdown, ego_network_relationship], wrap=True, widths="equal"
+            ),
+            ego_network_feature,
+            ego_network_node_limit,
+            mo.hstack([ego_network_neighbor_edges, ego_network_labels], wrap=True),
+            mo.md(
+                "Features are sorted by neighbor count, highest first. Search features recorded "
+                "among this ego's incoming or outgoing neighbors. The ego remains visible even "
+                "if it does not have the chosen feature. Nodes without recorded features match "
+                "only **All features**."
+            ),
+        ]
+    )
+    return
 
 
 @app.cell(hide_code=True)
@@ -1980,11 +2011,11 @@ def build_egocentric_network(ego_node_dropdown, nodes_lf):
     # counts containing only relationships whose endpoints belong to this network.
     egocentric_network_lf = (
         nodes_lf.filter(
-            pl.col("node").is_in(_ego_following_series),
+            pl.col("node").is_in(_ego_following_series.implode()),
         )
         .with_columns(
             pl.col(RELATIONSHIP_TYPES)
-            .list.filter(pl.element().is_in(_ego_following_series))
+            .list.filter(pl.element().is_in(_ego_following_series.implode()))
             .name.prefix("alter_")
         )
         .with_columns(
@@ -2001,6 +2032,426 @@ def build_egocentric_network(ego_node_dropdown, nodes_lf):
     )
 
     mo.ui.table(egocentric_network_lf)
+    return (ego_node,)
+
+
+@app.cell(hide_code=True)
+def define_ego_network_controls():
+    ego_network_relationship = mo.ui.dropdown(
+        options=[
+            "Following (outgoing)",
+            "Followers (incoming)",
+            "Friends (mutual)",
+            "All",
+        ],
+        value="Following (outgoing)",
+        label="Relationships to include",
+    )
+    ego_network_node_limit = mo.ui.slider(
+        start=10,
+        stop=200,
+        step=10,
+        value=80,
+        label="Maximum displayed nodes (including ego)",
+    )
+    ego_network_neighbor_edges = mo.ui.checkbox(
+        value=True,
+        label="Show connections between neighbors",
+    )
+    ego_network_labels = mo.ui.checkbox(value=False, label="Show all node IDs")
+    return (
+        ego_network_labels,
+        ego_network_neighbor_edges,
+        ego_network_node_limit,
+        ego_network_relationship,
+    )
+
+
+@app.cell(hide_code=True)
+def catalog_ego_network_features(ego_node, feats_lf, nodes_lf):
+    _ego_lists = (
+        nodes_lf.filter(pl.col("node") == ego_node)
+        .select("followers", "following")
+        .collect()
+        .row(0, named=True)
+    )
+    _neighbor_ids = pl.Series(
+        "node",
+        sorted(
+            (set(_ego_lists["followers"]) | set(_ego_lists["following"])) - {ego_node}
+        ),
+        dtype=pl.Int64,
+    )
+    ego_network_feature_catalog = (
+        nodes_lf.filter(pl.col("node").is_in(_neighbor_ids.implode()))
+        .select(pl.col("features").list.unique().alias("id"))
+        .explode("id")
+        .filter(pl.col("id").is_not_null())
+        .group_by("id")
+        .len(name="neighbors")
+        .join(feats_lf.select("id", "name"), on="id", how="left", validate="1:1")
+        .sort(["neighbors", "name", "id"], descending=[True, False, False])
+        .collect()
+    )
+    return (ego_network_feature_catalog,)
+
+
+@app.cell(hide_code=True)
+def select_ego_network_feature(ego_network_feature_catalog):
+    _feature_options = {"All features": None}
+    _feature_options.update(
+        {
+            f"{row['name']} (ID {row['id']}; {row['neighbors']:,} neighbors)": row["id"]
+            for row in ego_network_feature_catalog.iter_rows(named=True)
+        }
+    )
+    ego_network_feature = mo.ui.dropdown(
+        options=_feature_options,
+        value="All features",
+        allow_select_none=False,
+        searchable=True,
+        full_width=True,
+        label="Filter neighbors by node feature",
+    )
+    return (ego_network_feature,)
+
+
+@app.cell(hide_code=True)
+def collect_ego_network_visualization_data(
+    ego_network_feature,
+    ego_network_relationship,
+    ego_node,
+    nodes_lf,
+):
+    _ego_relationships = (
+        nodes_lf.filter(pl.col("node") == ego_node)
+        .select("followers", "following")
+        .collect()
+        .row(0, named=True)
+    )
+    _ego_followers = set(_ego_relationships["followers"]) - {ego_node}
+    _ego_following = set(_ego_relationships["following"]) - {ego_node}
+    _mode = ego_network_relationship.value
+    _neighbors = {
+        "Following (outgoing)": _ego_following,
+        "Followers (incoming)": _ego_followers,
+        "Friends (mutual)": _ego_followers & _ego_following,
+        "All": _ego_followers | _ego_following,
+    }[_mode]
+    if ego_network_feature.value is not None:
+        _candidate_ids = pl.Series("node", sorted(_neighbors), dtype=pl.Int64)
+        _neighbors = set(
+            nodes_lf.filter(pl.col("node").is_in(_candidate_ids.implode()))
+            .filter(pl.col("features").list.contains(ego_network_feature.value))
+            .select("node")
+            .collect()["node"]
+            .to_list()
+        )
+    _members = pl.Series("members", sorted(_neighbors | {ego_node}), dtype=pl.Int64)
+    _followers = pl.Series("followers", sorted(_ego_followers), dtype=pl.Int64)
+    _following = pl.Series("following", sorted(_ego_following), dtype=pl.Int64)
+    ego_network_visualization_data = (
+        nodes_lf.filter(pl.col("node").is_in(_members.implode()))
+        .select(
+            "node",
+            pl.col("following")
+            .list.filter(pl.element().is_in(_members.implode()))
+            .alias("alter_following"),
+            pl.col("followers")
+            .list.filter(pl.element().is_in(_members.implode()))
+            .list.len()
+            .alias("alter_followers_count"),
+            pl.col("following")
+            .list.filter(pl.element().is_in(_members.implode()))
+            .list.len()
+            .alias("alter_following_count"),
+            pl.col("node").is_in(_followers.implode()).alias("follows_ego"),
+            pl.col("node").is_in(_following.implode()).alias("ego_follows"),
+        )
+        .collect()
+    )
+    return (ego_network_visualization_data,)
+
+
+@app.cell(hide_code=True)
+def prepare_ego_network_plot_data(nx):
+    def build_ego_network_plot_data(
+        frame, selected_node, max_nodes, include_neighbor_edges, relationship_mode="All"
+    ):
+        """Lay out a bounded induced network; retain original IDs and full ego degrees."""
+        ranked = frame.with_columns(
+            (pl.col("alter_followers_count") + pl.col("alter_following_count")).alias(
+                "ego_network_degree"
+            )
+        ).sort(["ego_network_degree", "node"], descending=[True, False])
+        chosen = [selected_node] + (
+            ranked.filter(pl.col("node") != selected_node)
+            .head(max_nodes - 1)["node"]
+            .to_list()
+        )
+        chosen_set = set(chosen)
+        directed_edges = {
+            (row["node"], target)
+            for row in ranked.iter_rows(named=True)
+            if row["node"] in chosen_set
+            for target in row["alter_following"]
+            if target in chosen_set
+            and target != row["node"]
+            and (include_neighbor_edges or selected_node in (row["node"], target))
+        }
+        # The mode controls ego arrows; neighbor-to-neighbor edges remain an
+        # independent option. Classify nodes from the original relationship lists.
+        if relationship_mode == "Following (outgoing)":
+            directed_edges = {
+                (source, target)
+                for source, target in directed_edges
+                if target != selected_node
+            }
+        elif relationship_mode == "Followers (incoming)":
+            directed_edges = {
+                (source, target)
+                for source, target in directed_edges
+                if source != selected_node
+            }
+        graph = nx.DiGraph()
+        graph.add_nodes_from(chosen)
+        graph.add_edges_from(sorted(directed_edges))
+        positions = nx.spring_layout(graph.to_undirected(), seed=42, iterations=100)
+        metadata = {row["node"]: row for row in ranked.iter_rows(named=True)}
+        nodes = []
+        for node in chosen:
+            role = (
+                "Selected ego"
+                if node == selected_node
+                else "Mutual with ego"
+                if metadata[node]["ego_follows"] and metadata[node]["follows_ego"]
+                else "Follows ego"
+                if metadata[node]["follows_ego"]
+                else "Followed by ego"
+            )
+            nodes.append(
+                {
+                    "node": str(node),
+                    "x": float(positions[node][0]),
+                    "y": float(positions[node][1]),
+                    "role": role,
+                    "incoming": metadata[node]["alter_followers_count"],
+                    "outgoing": metadata[node]["alter_following_count"],
+                    "degree": metadata[node]["ego_network_degree"],
+                    "size": 350
+                    if node == selected_node
+                    else 65 + 10 * np.sqrt(graph.degree(node)),
+                }
+            )
+        links, arrows = [], []
+        for source, target in sorted(directed_edges):
+            start, end = positions[source], positions[target]
+            delta = end - start
+            length = float(np.linalg.norm(delta))
+            mutual = (target, source) in directed_edges
+            color = "#0d9488" if mutual else "#94a3b8"
+            edge = {
+                "source": str(source),
+                "target": str(target),
+                "color": color,
+                "relationship": "Mutual" if mutual else "One-way",
+                "x": float(start[0]),
+                "y": float(start[1]),
+                "x2": float(end[0]),
+                "y2": float(end[1]),
+            }
+            # Draw each mutual pair once, with a separate arrow for each direction.
+            if not mutual or source < target:
+                links.append(edge)
+            arrow_position = end - delta * min(0.035 / max(length, 1e-9), 0.35)
+            arrows.append(
+                {
+                    **edge,
+                    "x": float(arrow_position[0]),
+                    "y": float(arrow_position[1]),
+                    "angle": float(np.degrees(np.arctan2(delta[0], delta[1])) % 360),
+                }
+            )
+        return {
+            "nodes": nodes,
+            "links": links,
+            "arrows": arrows,
+            "total_nodes": frame.height,
+            "directed_edges": len(directed_edges),
+        }
+
+    return (build_ego_network_plot_data,)
+
+
+@app.cell(hide_code=True)
+def compute_ego_network_layout(
+    build_ego_network_plot_data,
+    ego_network_neighbor_edges,
+    ego_network_node_limit,
+    ego_network_relationship,
+    ego_network_visualization_data,
+    ego_node,
+):
+    ego_network_plot_data = build_ego_network_plot_data(
+        ego_network_visualization_data,
+        ego_node,
+        ego_network_node_limit.value,
+        ego_network_neighbor_edges.value,
+        ego_network_relationship.value,
+    )
+    return (ego_network_plot_data,)
+
+
+@app.cell(hide_code=True)
+def display_ego_network_visualization(
+    ego_network_feature,
+    ego_network_labels,
+    ego_network_neighbor_edges,
+    ego_network_plot_data,
+    ego_network_relationship,
+    ego_node,
+):
+    _plot = ego_network_plot_data
+    _x = alt.X("x:Q", axis=None, scale=alt.Scale(zero=False, padding=35))
+    _y = alt.Y("y:Q", axis=None, scale=alt.Scale(zero=False, padding=35))
+    _edge_tooltip = [
+        alt.Tooltip("source:N", title="From (follower)"),
+        alt.Tooltip("target:N", title="To (followed account)"),
+        alt.Tooltip("relationship:N", title="Relationship"),
+    ]
+    _edges = (
+        alt.Chart(alt.Data(values=_plot["links"]))
+        .mark_rule(
+            opacity=0.35,
+            strokeWidth=0.8,
+        )
+        .encode(
+            x=_x,
+            y=_y,
+            x2="x2:Q",
+            y2="y2:Q",
+            color=alt.Color("color:N", scale=None),
+            tooltip=_edge_tooltip,
+        )
+    )
+    _arrows = (
+        alt.Chart(alt.Data(values=_plot["arrows"]))
+        .mark_point(
+            shape="triangle-up",
+            angle=alt.ExprRef(
+                expr="atan2(scale('x', datum.x2) - scale('x', datum.x), scale('y', datum.y) - scale('y', datum.y2)) * 180 / PI"
+            ),
+            filled=True,
+            size=24,
+            opacity=0.65,
+        )
+        .encode(
+            x=_x,
+            y=_y,
+            color=alt.Color("color:N", scale=None),
+            tooltip=_edge_tooltip,
+        )
+    )
+    _node_chart = alt.Chart(alt.Data(values=_plot["nodes"]))
+    _nodes = _node_chart.mark_circle(stroke="white", strokeWidth=1.3, opacity=1).encode(
+        x=_x,
+        y=_y,
+        size=alt.Size("size:Q", scale=None, legend=None),
+        color=alt.Color(
+            "role:N",
+            title="Node relationship",
+            scale=alt.Scale(
+                domain=[
+                    "Selected ego",
+                    "Mutual with ego",
+                    "Followed by ego",
+                    "Follows ego",
+                ],
+                range=["#f59e0b", "#0d9488", "#3b82f6", "#a855f7"],
+            ),
+            legend=alt.Legend(orient="bottom"),
+        ),
+        tooltip=[
+            alt.Tooltip("node:N", title="Node ID"),
+            alt.Tooltip("role:N", title="Relationship to ego"),
+            alt.Tooltip(
+                "incoming:Q", title="Followers in full ego network", format=",d"
+            ),
+            alt.Tooltip(
+                "outgoing:Q", title="Following in full ego network", format=",d"
+            ),
+        ],
+    )
+    _labels = (
+        _node_chart.transform_filter(
+            alt.datum.role == "Selected ego" if not ego_network_labels.value else "true"
+        )
+        .mark_text(dy=-16, fontSize=10, color="#475569")
+        .encode(x=_x, y=_y, text="node:N")
+    )
+    ego_network_chart = (
+        alt.layer(_edges, _arrows, _nodes, _labels)
+        .properties(
+            width="container",
+            height=520,
+            title=f"Node {ego_node}: {ego_network_relationship.value}",
+        )
+        .configure_view(stroke=None)
+        .interactive()
+    )
+    _shown = len(_plot["nodes"])
+    _scope = (
+        "Connections between neighbors are included."
+        if ego_network_neighbor_edges.value
+        else "Only connections involving the ego are shown."
+    )
+    mo.vstack(
+        [
+            mo.md(
+                f"**{ego_network_relationship.value}** · **{_shown:,} of {_plot['total_nodes']:,} nodes** · "
+                f"**{_plot['directed_edges']:,} displayed directed edges**. "
+                + (
+                    "The ego is always retained; remaining nodes are ranked by incoming + outgoing degree within the full ego network. "
+                    if _shown < _plot["total_nodes"]
+                    else "All nodes in this ego network are displayed. "
+                )
+                + _scope
+            ),
+            mo.md(
+                f"**Node feature:** {ego_network_feature.selected_key}. "
+                + (
+                    "No neighbors match this feature and relationship filter; only the ego is shown. "
+                    if _plot["total_nodes"] == 1
+                    and ego_network_feature.value is not None
+                    else ""
+                )
+                + (
+                    "The ego is retained as a reference regardless of its features."
+                    if ego_network_feature.value is not None
+                    else ""
+                )
+            ),
+            mo.ui.altair_chart(
+                ego_network_chart, chart_selection=False, legend_selection=False
+            ),
+            mo.md(
+                "Hover for node IDs and connection counts; scroll to zoom, drag to pan, and double-click to reset. "
+                "Arrows point from follower to followed account. Teal edges are mutual; gray edges are one-way. "
+                "Larger neighbors have more displayed connections. Positions show network structure, not geography. "
+                "The relationship selector chooses neighbors relative to the ego: following shows outgoing ego arrows, "
+                "followers shows incoming ego arrows, friends retains both directions for mutual neighbors, "
+                "and all includes both sets of neighbors and directions. Connections between neighbors, when enabled, "
+                "retain their observed directions. Node colors describe the original relationship to the ego, "
+                "even when one arrow direction is hidden. Counts refer to the full selected network before the display limit. "
+                "Self-loops are omitted."
+            ),
+        ]
+    )
+    return
+
+
+@app.cell
+def _():
     return
 
 
