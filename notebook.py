@@ -13,12 +13,11 @@ with app.setup:
     import polars as pl
     import numpy as np
     import altair as alt
+    import networkx as nx
 
 
 @app.cell(hide_code=True)
 def resolve_data_paths():
-    import networkx as nx
-
     # Resolve every data location relative to this notebook so it can be run
     # from any working directory.
     ROOT_PATH = Path(__file__).resolve().parent
@@ -26,7 +25,7 @@ def resolve_data_paths():
     DATA_PATH = ROOT_PATH / "data"
     TWITTER_COMBINED_TXT_PATH = DATA_PATH / "twitter_combined.txt"
     PARQUET_OUT_PATH = DATA_PATH / "out"
-    return DATA_PATH, PARQUET_OUT_PATH, TWITTER_COMBINED_TXT_PATH, nx
+    return DATA_PATH, PARQUET_OUT_PATH, TWITTER_COMBINED_TXT_PATH
 
 
 @app.cell(hide_code=True)
@@ -1363,6 +1362,263 @@ def display_node_centrality(
 
 
 @app.cell(hide_code=True)
+def control_pagerank_network():
+    pagerank_network_neighbors = mo.ui.slider(
+        start=1,
+        stop=5,
+        step=1,
+        value=3,
+        full_width=True,
+        label="Top connected neighbors per PageRank node",
+    )
+    pagerank_network_labels = mo.ui.checkbox(value=False, label="Show all node IDs")
+    mo.vstack(
+        [
+            mo.md("### Network of top PageRank nodes"),
+            topic_widget_grid([pagerank_network_neighbors, pagerank_network_labels]),
+            mo.md(
+                "The **Top nodes** control above sets how many accounts are selected by PageRank. "
+                "For each account, add the most-connected nodes it follows, ranked by total "
+                "incoming + outgoing connections in this dataset. Ties use PageRank, then node ID. "
+                "The plot includes all observed directed edges between the displayed nodes. "
+                "This view always uses PageRank, regardless of the centrality measure selected above."
+            ),
+        ]
+    )
+    return pagerank_network_labels, pagerank_network_neighbors
+
+
+@app.function(hide_code=True)
+def build_pagerank_network_data(
+    scores, adjacency, node_ids, top_count, neighbors_per_node
+):
+    """Select top PageRank nodes and each one's highest-degree outgoing neighbors."""
+    ordered = scores.sort(["PageRank", "node"], descending=[True, False])
+    top_nodes = ordered.head(top_count)["node"].to_list()
+    top_set = set(top_nodes)
+    metadata = {row["node"]: row for row in ordered.iter_rows(named=True)}
+    ranks = {node: rank for rank, node in enumerate(ordered["node"], start=1)}
+    selected = set(top_nodes)
+    for node in top_nodes:
+        index = int(np.searchsorted(node_ids, node))
+        targets = node_ids[
+            adjacency.indices[adjacency.indptr[index] : adjacency.indptr[index + 1]]
+        ]
+        neighbors = sorted(
+            (int(target) for target in targets if target != node),
+            key=lambda target: (
+                -(metadata[target]["in_degree"] + metadata[target]["out_degree"]),
+                -metadata[target]["PageRank"],
+                target,
+            ),
+        )[:neighbors_per_node]
+        selected.update(neighbors)
+    selected_nodes = sorted(selected)
+    indices = np.searchsorted(node_ids, selected_nodes)
+    subgraph = adjacency[indices, :][:, indices].tocoo()
+    edges = {
+        (selected_nodes[int(source)], selected_nodes[int(target)])
+        for source, target in zip(subgraph.row, subgraph.col)
+        if source != target
+    }
+    graph = nx.DiGraph()
+    graph.add_nodes_from(selected_nodes)
+    graph.add_edges_from(sorted(edges))
+    positions = nx.spring_layout(graph.to_undirected(), seed=42, iterations=100)
+    max_score = max(
+        (metadata[node]["PageRank"] for node in selected_nodes), default=1.0
+    )
+    nodes = []
+    for node in selected_nodes:
+        row = metadata[node]
+        nodes.append(
+            {
+                "node": str(node),
+                "x": float(positions[node][0]),
+                "y": float(positions[node][1]),
+                "role": "Top PageRank node"
+                if node in top_set
+                else "Connected neighbor",
+                "pagerank": row["PageRank"],
+                "rank": ranks[node],
+                "incoming": row["in_degree"],
+                "outgoing": row["out_degree"],
+                "connections": row["in_degree"] + row["out_degree"],
+                "size": float(80 + 400 * np.sqrt(row["PageRank"] / max_score))
+                if max_score
+                else 80.0,
+            }
+        )
+    links, arrows = [], []
+    for source, target in sorted(edges):
+        start, end = positions[source], positions[target]
+        delta = end - start
+        length = float(np.linalg.norm(delta))
+        mutual = (target, source) in edges
+        edge = {
+            "source": str(source),
+            "target": str(target),
+            "relationship": "Mutual" if mutual else "One-way",
+            "color": "#0d9488" if mutual else "#94a3b8",
+            "x": float(start[0]),
+            "y": float(start[1]),
+            "x2": float(end[0]),
+            "y2": float(end[1]),
+        }
+        if not mutual or source < target:
+            links.append(edge)
+        arrow_position = end - delta * min(0.045 / max(length, 1e-9), 0.35)
+        arrows.append(
+            {**edge, "x": float(arrow_position[0]), "y": float(arrow_position[1])}
+        )
+    return {
+        "nodes": nodes,
+        "links": links,
+        "arrows": arrows,
+        "top_nodes": len(top_nodes),
+        "neighbors": len(selected - top_set),
+        "directed_edges": len(edges),
+    }
+
+
+@app.cell(hide_code=True)
+def compute_pagerank_network(
+    centrality_scores,
+    centrality_top_count,
+    network_adjacency,
+    network_node_ids,
+    pagerank_network_neighbors,
+):
+    pagerank_network_data = build_pagerank_network_data(
+        centrality_scores,
+        network_adjacency,
+        network_node_ids,
+        centrality_top_count.value,
+        pagerank_network_neighbors.value,
+    )
+    return (pagerank_network_data,)
+
+
+@app.cell(hide_code=True)
+def display_pagerank_network(pagerank_network_data, pagerank_network_labels):
+    _network = pagerank_network_data
+    mo.stop(
+        not _network["nodes"], mo.md("No nodes are available for the PageRank network.")
+    )
+    _x = alt.X("x:Q", axis=None, scale=alt.Scale(zero=False, padding=35))
+    _y = alt.Y("y:Q", axis=None, scale=alt.Scale(zero=False, padding=35))
+    _edge_tooltip = [
+        alt.Tooltip("source:N", title="From (follower)"),
+        alt.Tooltip("target:N", title="To (followed account)"),
+        alt.Tooltip("relationship:N", title="Relationship"),
+    ]
+    _links = (
+        alt.Chart(alt.Data(values=_network["links"]))
+        .mark_rule(
+            opacity=0.35,
+            strokeWidth=0.8,
+        )
+        .encode(
+            x=_x,
+            y=_y,
+            x2="x2:Q",
+            y2="y2:Q",
+            color=alt.Color("color:N", scale=None, legend=None),
+            tooltip=_edge_tooltip,
+        )
+    )
+    _arrows = (
+        alt.Chart(alt.Data(values=_network["arrows"]))
+        .mark_point(
+            shape="triangle-up",
+            filled=True,
+            size=28,
+            opacity=0.7,
+            angle=alt.ExprRef(
+                expr="atan2(scale('x', datum.x2) - scale('x', datum.x), scale('y', datum.y) - scale('y', datum.y2)) * 180 / PI"
+            ),
+        )
+        .encode(
+            x=_x,
+            y=_y,
+            color=alt.Color("color:N", scale=None, legend=None),
+            tooltip=_edge_tooltip,
+        )
+    )
+    _node_base = alt.Chart(alt.Data(values=_network["nodes"]))
+    _nodes = _node_base.mark_circle(stroke="white", strokeWidth=1.3, opacity=1).encode(
+        x=_x,
+        y=_y,
+        size=alt.Size("size:Q", scale=None, legend=None),
+        color=alt.Color(
+            "role:N",
+            title="Node group",
+            scale=alt.Scale(
+                domain=["Top PageRank node", "Connected neighbor"],
+                range=["#f59e0b", "#3b82f6"],
+            ),
+            legend=alt.Legend(orient="bottom"),
+        ),
+        tooltip=[
+            alt.Tooltip("node:N", title="Node ID"),
+            alt.Tooltip("role:N", title="Group"),
+            alt.Tooltip("rank:Q", title="Global PageRank rank", format=",d"),
+            alt.Tooltip("pagerank:Q", title="PageRank", format=".6g"),
+            alt.Tooltip("incoming:Q", title="Incoming connections", format=",d"),
+            alt.Tooltip("outgoing:Q", title="Outgoing connections", format=",d"),
+            alt.Tooltip("connections:Q", title="Total connections", format=",d"),
+        ],
+    )
+    _labels = (
+        _node_base.transform_filter(
+            "true"
+            if pagerank_network_labels.value
+            else alt.datum.role == "Top PageRank node"
+        )
+        .mark_text(dy=-17, fontSize=10, color="#475569")
+        .encode(x=_x, y=_y, text="node:N")
+    )
+    pagerank_network_chart = (
+        alt.layer(_links, _arrows, _nodes, _labels)
+        .properties(
+            width="container",
+            height=580,
+            title=f"Top {_network['top_nodes']} PageRank nodes and their connected neighbors",
+        )
+        .resolve_scale(color="independent")
+        .configure_view(stroke=None)
+        .interactive()
+    )
+    mo.vstack(
+        [
+            topic_widget_grid(
+                [
+                    mo.stat(f"{_network['top_nodes']:,}", label="Top PageRank nodes"),
+                    mo.stat(
+                        f"{_network['neighbors']:,}", label="Additional connected nodes"
+                    ),
+                    mo.stat(
+                        f"{_network['directed_edges']:,}",
+                        label="Displayed directed edges",
+                    ),
+                ]
+            ),
+            mo.ui.altair_chart(
+                pagerank_network_chart, chart_selection=False, legend_selection=False
+            ),
+            mo.md(
+                "Orange nodes are the top PageRank accounts; blue nodes are their selected outgoing neighbors. "
+                "Node size represents PageRank. Arrows point from follower to followed account; teal edges are "
+                "mutual and gray edges are one-way. Hover for node IDs, PageRank, and connection counts. "
+                "Scroll to zoom, drag to pan, and double-click to reset. Shared neighbors appear once, "
+                "and every ranked node is retained even if it has no outgoing connections. Self-loops are omitted."
+            ),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
 def compare_centrality_rankings(
     centrality_diagnostics,
     centrality_methods,
@@ -2131,7 +2387,7 @@ def build_egocentric_network(ego_node_dropdown, nodes_lf):
     return (ego_node,)
 
 
-@app.cell(hide_code=True)
+@app.cell
 def define_ego_network_controls():
     ego_network_relationship = mo.ui.dropdown(
         options=[
@@ -2165,7 +2421,7 @@ def define_ego_network_controls():
     )
 
 
-@app.cell(hide_code=True)
+@app.cell
 def catalog_ego_network_features(ego_node, feats_lf, nodes_lf):
     _ego_lists = (
         nodes_lf.filter(pl.col("node") == ego_node)
@@ -2271,119 +2527,115 @@ def collect_ego_network_visualization_data(
     return (ego_network_visualization_data,)
 
 
-@app.cell(hide_code=True)
-def prepare_ego_network_plot_data(nx):
-    def build_ego_network_plot_data(
-        frame, selected_node, max_nodes, include_neighbor_edges, relationship_mode="All"
-    ):
-        """Lay out a bounded induced network; retain original IDs and full ego degrees."""
-        ranked = frame.with_columns(
-            (pl.col("alter_followers_count") + pl.col("alter_following_count")).alias(
-                "ego_network_degree"
-            )
-        ).sort(["ego_network_degree", "node"], descending=[True, False])
-        chosen = [selected_node] + (
-            ranked.filter(pl.col("node") != selected_node)
-            .head(max_nodes - 1)["node"]
-            .to_list()
+@app.function(hide_code=True)
+def build_ego_network_plot_data(
+    frame, selected_node, max_nodes, include_neighbor_edges, relationship_mode="All"
+):
+    """Lay out a bounded induced network; retain original IDs and full ego degrees."""
+    ranked = frame.with_columns(
+        (pl.col("alter_followers_count") + pl.col("alter_following_count")).alias(
+            "ego_network_degree"
         )
-        chosen_set = set(chosen)
+    ).sort(["ego_network_degree", "node"], descending=[True, False])
+    chosen = [selected_node] + (
+        ranked.filter(pl.col("node") != selected_node)
+        .head(max_nodes - 1)["node"]
+        .to_list()
+    )
+    chosen_set = set(chosen)
+    directed_edges = {
+        (row["node"], target)
+        for row in ranked.iter_rows(named=True)
+        if row["node"] in chosen_set
+        for target in row["alter_following"]
+        if target in chosen_set
+        and target != row["node"]
+        and (include_neighbor_edges or selected_node in (row["node"], target))
+    }
+    # The mode controls ego arrows; neighbor-to-neighbor edges remain an
+    # independent option. Classify nodes from the original relationship lists.
+    if relationship_mode == "Following (outgoing)":
         directed_edges = {
-            (row["node"], target)
-            for row in ranked.iter_rows(named=True)
-            if row["node"] in chosen_set
-            for target in row["alter_following"]
-            if target in chosen_set
-            and target != row["node"]
-            and (include_neighbor_edges or selected_node in (row["node"], target))
+            (source, target)
+            for source, target in directed_edges
+            if target != selected_node
         }
-        # The mode controls ego arrows; neighbor-to-neighbor edges remain an
-        # independent option. Classify nodes from the original relationship lists.
-        if relationship_mode == "Following (outgoing)":
-            directed_edges = {
-                (source, target)
-                for source, target in directed_edges
-                if target != selected_node
-            }
-        elif relationship_mode == "Followers (incoming)":
-            directed_edges = {
-                (source, target)
-                for source, target in directed_edges
-                if source != selected_node
-            }
-        graph = nx.DiGraph()
-        graph.add_nodes_from(chosen)
-        graph.add_edges_from(sorted(directed_edges))
-        positions = nx.spring_layout(graph.to_undirected(), seed=42, iterations=100)
-        metadata = {row["node"]: row for row in ranked.iter_rows(named=True)}
-        nodes = []
-        for node in chosen:
-            role = (
-                "Selected ego"
+    elif relationship_mode == "Followers (incoming)":
+        directed_edges = {
+            (source, target)
+            for source, target in directed_edges
+            if source != selected_node
+        }
+    graph = nx.DiGraph()
+    graph.add_nodes_from(chosen)
+    graph.add_edges_from(sorted(directed_edges))
+    positions = nx.spring_layout(graph.to_undirected(), seed=42, iterations=100)
+    metadata = {row["node"]: row for row in ranked.iter_rows(named=True)}
+    nodes = []
+    for node in chosen:
+        role = (
+            "Selected ego"
+            if node == selected_node
+            else "Mutual with ego"
+            if metadata[node]["ego_follows"] and metadata[node]["follows_ego"]
+            else "Follows ego"
+            if metadata[node]["follows_ego"]
+            else "Followed by ego"
+        )
+        nodes.append(
+            {
+                "node": str(node),
+                "x": float(positions[node][0]),
+                "y": float(positions[node][1]),
+                "role": role,
+                "incoming": metadata[node]["alter_followers_count"],
+                "outgoing": metadata[node]["alter_following_count"],
+                "degree": metadata[node]["ego_network_degree"],
+                "size": 350
                 if node == selected_node
-                else "Mutual with ego"
-                if metadata[node]["ego_follows"] and metadata[node]["follows_ego"]
-                else "Follows ego"
-                if metadata[node]["follows_ego"]
-                else "Followed by ego"
-            )
-            nodes.append(
-                {
-                    "node": str(node),
-                    "x": float(positions[node][0]),
-                    "y": float(positions[node][1]),
-                    "role": role,
-                    "incoming": metadata[node]["alter_followers_count"],
-                    "outgoing": metadata[node]["alter_following_count"],
-                    "degree": metadata[node]["ego_network_degree"],
-                    "size": 350
-                    if node == selected_node
-                    else 65 + 10 * np.sqrt(graph.degree(node)),
-                }
-            )
-        links, arrows = [], []
-        for source, target in sorted(directed_edges):
-            start, end = positions[source], positions[target]
-            delta = end - start
-            length = float(np.linalg.norm(delta))
-            mutual = (target, source) in directed_edges
-            color = "#0d9488" if mutual else "#94a3b8"
-            edge = {
-                "source": str(source),
-                "target": str(target),
-                "color": color,
-                "relationship": "Mutual" if mutual else "One-way",
-                "x": float(start[0]),
-                "y": float(start[1]),
-                "x2": float(end[0]),
-                "y2": float(end[1]),
+                else 65 + 10 * np.sqrt(graph.degree(node)),
             }
-            # Draw each mutual pair once, with a separate arrow for each direction.
-            if not mutual or source < target:
-                links.append(edge)
-            arrow_position = end - delta * min(0.035 / max(length, 1e-9), 0.35)
-            arrows.append(
-                {
-                    **edge,
-                    "x": float(arrow_position[0]),
-                    "y": float(arrow_position[1]),
-                    "angle": float(np.degrees(np.arctan2(delta[0], delta[1])) % 360),
-                }
-            )
-        return {
-            "nodes": nodes,
-            "links": links,
-            "arrows": arrows,
-            "total_nodes": frame.height,
-            "directed_edges": len(directed_edges),
+        )
+    links, arrows = [], []
+    for source, target in sorted(directed_edges):
+        start, end = positions[source], positions[target]
+        delta = end - start
+        length = float(np.linalg.norm(delta))
+        mutual = (target, source) in directed_edges
+        color = "#0d9488" if mutual else "#94a3b8"
+        edge = {
+            "source": str(source),
+            "target": str(target),
+            "color": color,
+            "relationship": "Mutual" if mutual else "One-way",
+            "x": float(start[0]),
+            "y": float(start[1]),
+            "x2": float(end[0]),
+            "y2": float(end[1]),
         }
-
-    return (build_ego_network_plot_data,)
+        # Draw each mutual pair once, with a separate arrow for each direction.
+        if not mutual or source < target:
+            links.append(edge)
+        arrow_position = end - delta * min(0.035 / max(length, 1e-9), 0.35)
+        arrows.append(
+            {
+                **edge,
+                "x": float(arrow_position[0]),
+                "y": float(arrow_position[1]),
+                "angle": float(np.degrees(np.arctan2(delta[0], delta[1])) % 360),
+            }
+        )
+    return {
+        "nodes": nodes,
+        "links": links,
+        "arrows": arrows,
+        "total_nodes": frame.height,
+        "directed_edges": len(directed_edges),
+    }
 
 
 @app.cell(hide_code=True)
 def compute_ego_network_layout(
-    build_ego_network_plot_data,
     ego_network_neighbor_edges,
     ego_network_node_limit,
     ego_network_relationship,
