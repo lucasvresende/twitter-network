@@ -1033,9 +1033,333 @@ def degree_analysis_inequality(
 
 
 @app.cell(hide_code=True)
+def describe_node_centrality():
+    mo.md(r"""
+    ## 2. Node centrality
+
+    Degree measures direct connections. **PageRank** measures attention received
+    from accounts that themselves receive attention; **HITS authority** rewards
+    being followed by strong hubs, while **HITS hub** rewards following strong
+    authorities. These are structural scores, not evidence of real-world influence.
+
+    An edge points from the follower to the followed account. All consolidated
+    nodes are included; duplicate edges and self-loops are excluded, matching the
+    connectivity analysis. In/out degree centrality divides each count by N − 1.
+    PageRank uses damping 0.85, uniform teleportation, and redistributes dangling
+    nodes' mass uniformly. HITS scores are normalized to sum to one. Scores from
+    different methods have different scales: compare their ranks.
+    """)
+    return
+
+
+@app.function(hide_code=True)
+def compute_node_centrality(
+    adjacency, node_ids, tolerance=1e-10, max_iterations=1000
+):
+    """Compute sparse directed centralities and record convergence diagnostics."""
+    graph = adjacency.astype(np.float64).tocsr(copy=True)
+    n = len(node_ids)
+    if n == 0:
+        raise ValueError("Centrality requires at least one node")
+    outgoing = np.asarray(graph.sum(axis=1)).ravel()
+    incoming = np.asarray(graph.sum(axis=0)).ravel()
+    transpose = graph.T.tocsr()
+    inverse_outgoing = np.divide(1.0, outgoing, out=np.zeros(n), where=outgoing > 0)
+    pagerank = np.full(n, 1.0 / n)
+    diagnostics = []
+    for iteration in range(1, max_iterations + 1):
+        updated = (
+            0.85
+            * (
+                transpose @ (pagerank * inverse_outgoing)
+                + pagerank[outgoing == 0].sum() / n
+            )
+            + 0.15 / n
+        )
+        residual = float(np.abs(updated - pagerank).sum())
+        pagerank = updated
+        if residual <= tolerance:
+            break
+    diagnostics.append(
+        {
+            "method": "PageRank",
+            "iterations": iteration,
+            "L1_change": residual,
+            "converged": residual <= tolerance,
+        }
+    )
+    hubs = np.full(n, 1.0 / n)
+    authorities = np.zeros(n)
+    residual = 0.0
+    iteration = 0
+    if graph.nnz:
+        for iteration in range(1, max_iterations + 1):
+            new_authorities = transpose @ hubs
+            new_authorities /= new_authorities.sum()
+            new_hubs = graph @ new_authorities
+            new_hubs /= new_hubs.sum()
+            residual = float(
+                max(
+                    np.abs(new_hubs - hubs).sum(),
+                    np.abs(new_authorities - authorities).sum(),
+                )
+            )
+            hubs, authorities = new_hubs, new_authorities
+            if residual <= tolerance:
+                break
+    else:
+        hubs = np.zeros(n)
+    diagnostics.append(
+        {
+            "method": "HITS",
+            "iterations": iteration,
+            "L1_change": residual,
+            "converged": residual <= tolerance,
+        }
+    )
+    scores = pl.DataFrame(
+        {
+            "node": node_ids,
+            "in_degree": incoming.astype(np.int64),
+            "out_degree": outgoing.astype(np.int64),
+            "In-degree centrality": incoming / max(n - 1, 1),
+            "Out-degree centrality": outgoing / max(n - 1, 1),
+            "PageRank": pagerank / pagerank.sum(),
+            "HITS authority": authorities,
+            "HITS hub": hubs,
+        }
+    )
+    return scores, pl.DataFrame(diagnostics)
+
+
+@app.cell(hide_code=True)
+def compute_node_centrality_scores(network_adjacency, network_node_ids):
+    centrality_scores, centrality_diagnostics = compute_node_centrality(
+        network_adjacency, network_node_ids
+    )
+    centrality_methods = [
+        "In-degree centrality",
+        "Out-degree centrality",
+        "PageRank",
+        "HITS authority",
+        "HITS hub",
+    ]
+    centrality_ranks = centrality_scores.select(
+        "node",
+        *[
+            pl.col(_method).rank(method="average", descending=True).alias(_method)
+            for _method in centrality_methods
+        ],
+    )
+    centrality_rank_agreement = pl.DataFrame(
+        [
+            {
+                "method": _first,
+                "comparison": _second,
+                "Spearman correlation": float(
+                    np.corrcoef(
+                        centrality_ranks[_first].to_numpy(),
+                        centrality_ranks[_second].to_numpy(),
+                    )[0, 1]
+                ),
+            }
+            for _first in centrality_methods
+            for _second in centrality_methods
+        ]
+    )
+    mo.stop(
+        not centrality_diagnostics["converged"].all(),
+        mo.md(
+            "Centrality iteration did not converge. Inspect centrality_diagnostics before interpreting rankings."
+        ),
+    )
+    return (
+        centrality_diagnostics,
+        centrality_methods,
+        centrality_rank_agreement,
+        centrality_scores,
+    )
+
+
+@app.cell(hide_code=True)
+def select_centrality_measure(centrality_methods):
+    centrality_method_selector = mo.ui.dropdown(
+        options=centrality_methods, value="PageRank", label="Centrality measure"
+    )
+    centrality_top_count = mo.ui.slider(
+        start=10, stop=50, step=10, value=20, label="Top nodes"
+    )
+    mo.hstack([centrality_method_selector, centrality_top_count], wrap=True)
+    return centrality_method_selector, centrality_top_count
+
+
+@app.cell(hide_code=True)
+def display_node_centrality(
+    centrality_method_selector,
+    centrality_scores,
+    centrality_top_count,
+):
+    _method = centrality_method_selector.value
+    _ordered = centrality_scores.sort([_method, "node"], descending=[True, False])
+    _top = _ordered.head(centrality_top_count.value).with_columns(
+        pl.col("node").cast(pl.String).alias("account")
+    )
+    _values = _ordered[_method].to_numpy()
+    _positive = _values[_values > 0]
+    _top_fraction = (
+        float(
+            _values[: max(1, int(np.ceil(len(_values) * 0.01)))].sum() / _values.sum()
+        )
+        if _values.sum()
+        else 0.0
+    )
+    _bar = (
+        alt.Chart(_top)
+        .mark_bar(color="#2563a6")
+        .encode(
+            x=alt.X(f"{_method}:Q", title=_method),
+            y=alt.Y("account:N", sort=_top["account"].to_list(), title="Node ID"),
+            tooltip=[
+                "account:N",
+                alt.Tooltip(f"{_method}:Q", format=".6g"),
+                "in_degree:Q",
+                "out_degree:Q",
+            ],
+        )
+        .properties(
+            width="container",
+            height=centrality_top_count.value * 20,
+            title=f"Top nodes by {_method}",
+        )
+    )
+    _distribution_outputs = []
+    if _positive.size:
+        _logs = np.log10(_positive)
+        _counts, _bins = np.histogram(_logs, bins=40)
+        _histogram = pl.DataFrame(
+            {"lower": 10.0 ** _bins[:-1], "upper": 10.0 ** _bins[1:], "nodes": _counts}
+        )
+        _hist = (
+            alt.Chart(_histogram)
+            .mark_bar(color="#2563a6")
+            .encode(
+                x=alt.X(
+                    "lower:Q",
+                    scale=alt.Scale(type="log"),
+                    title=f"{_method} (log scale)",
+                ),
+                x2="upper:Q",
+                y=alt.Y("nodes:Q", title="Nodes"),
+                tooltip=[
+                    alt.Tooltip("lower:Q", format=".4g"),
+                    alt.Tooltip("upper:Q", format=".4g"),
+                    "nodes:Q",
+                ],
+            )
+            .properties(
+                width="container", height=260, title="Distribution of positive scores"
+            )
+        )
+        _distribution_outputs.append(
+            mo.ui.altair_chart(_hist, chart_selection=False, legend_selection=False)
+        )
+    mo.vstack(
+        [
+            mo.md(f"### {_method}"),
+            mo.hstack(
+                [
+                    mo.stat(f"{len(_values):,}", label="Nodes scored"),
+                    mo.stat(f"{np.count_nonzero(_values == 0):,}", label="Zero scores"),
+                    mo.stat(f"{_top_fraction:.1%}", label="Score share held by top 1%"),
+                ],
+                widths="equal",
+                wrap=True,
+            ),
+            mo.ui.altair_chart(_bar, chart_selection=False, legend_selection=False),
+            *_distribution_outputs,
+            mo.md(
+                "Zero scores are counted above and excluded from the logarithmic histogram. Top 1% uses ceil(0.01 × N) nodes. Equal scores are ordered by node ID for display; ranks used below average ties."
+            ),
+            mo.ui.table(
+                _top.drop("account"),
+                selection=None,
+                pagination=True,
+                show_data_types=False,
+                show_column_summaries=False,
+            ),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def compare_centrality_rankings(
+    centrality_diagnostics,
+    centrality_methods,
+    centrality_rank_agreement,
+    centrality_scores,
+):
+    _agreement_chart = (
+        alt.Chart(centrality_rank_agreement)
+        .mark_rect()
+        .encode(
+            x=alt.X(
+                "method:N",
+                sort=centrality_methods,
+                title=None,
+                axis=alt.Axis(labelAngle=-30),
+            ),
+            y=alt.Y("comparison:N", sort=centrality_methods, title=None),
+            color=alt.Color(
+                "Spearman correlation:Q",
+                scale=alt.Scale(domain=[-1, 1], scheme="redblue"),
+            ),
+            tooltip=[
+                "method:N",
+                "comparison:N",
+                alt.Tooltip("Spearman correlation:Q", format=".3f"),
+            ],
+        )
+        .properties(
+            width="container", height=260, title="Agreement between centrality rankings"
+        )
+    )
+    _pr_leader = centrality_scores.sort(
+        ["PageRank", "node"], descending=[True, False]
+    ).row(0, named=True)
+    _authority_leader = centrality_scores.sort(
+        ["HITS authority", "node"], descending=[True, False]
+    ).row(0, named=True)
+    _hub_leader = centrality_scores.sort(
+        ["HITS hub", "node"], descending=[True, False]
+    ).row(0, named=True)
+    mo.vstack(
+        [
+            mo.md(
+                f"### Comparing rankings\n\nNode **{_pr_leader['node']}** leads PageRank; node **{_authority_leader['node']}** leads HITS authority; node **{_hub_leader['node']}** leads HITS hub. The heatmap compares rankings over all nodes, including tied scores. Correlation near 1 means similar ordering; near 0 means little monotonic agreement."
+            ),
+            mo.ui.altair_chart(
+                _agreement_chart, chart_selection=False, legend_selection=False
+            ),
+            mo.md(
+                "PageRank spreads attention through the graph, while HITS emphasizes mutually reinforcing hubs and authorities. Disconnected regions can receive very different HITS weight. These measures do not assess shortest-path brokerage; betweenness and closeness require a separate treatment of reachability and computation cost on this graph."
+            ),
+            mo.accordion(
+                {
+                    "Convergence diagnostics": mo.ui.table(
+                        centrality_diagnostics, selection=None, pagination=False
+                    )
+                }
+            ),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
 def describe_components_and_reciprocity():
     mo.md(r"""
-    ## 2. Components and reciprocity
+    ## 3. Components and reciprocity
 
     A **weak component** connects nodes when edge direction is ignored. In a
     **strong component**, every node can reach every other node along directed
@@ -1248,6 +1572,8 @@ def compute_components_and_reciprocity(
         component_memberships,
         component_sizes,
         component_summary,
+        network_adjacency,
+        network_node_ids,
         network_structure_totals,
         node_reciprocity,
         node_reciprocity_histogram,
