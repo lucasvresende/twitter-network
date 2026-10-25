@@ -709,14 +709,37 @@ def degree_analysis_summary(degree_counts, degree_summary):
     return
 
 
+@app.function(hide_code=True)
+def topic_widget_grid(items):
+    """Arrange related widgets in equal responsive columns with readable spacing."""
+    cards = "".join(
+        '<div style="min-width:0;padding:1rem;border:1px solid '
+        'var(--gray-5, #e2e8f0);border-radius:0.65rem;">'
+        + mo.as_html(item).text
+        + "</div>"
+        for item in items
+    )
+    return mo.Html(
+        '<div class="topic-widget-grid" style="display:grid;'
+        "grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr));"
+        'gap:1rem;align-items:stretch;width:100%;">' + cards + "</div>"
+    )
+
+
 @app.cell(hide_code=True)
 def degree_analysis_selector(degree_metrics):
     degree_metric_selector = mo.ui.dropdown(
         options=list(degree_metrics),
         value="Followers (in-degree)",
         label="Relationship to explore",
+        full_width=True,
     )
-    degree_metric_selector
+    mo.vstack(
+        [
+            mo.md("### Degree controls"),
+            topic_widget_grid([degree_metric_selector]),
+        ]
+    )
     return (degree_metric_selector,)
 
 
@@ -963,12 +986,12 @@ def degree_analysis_inequality(
     ).properties(
         title=f"Connection share held by top-ranked nodes — {selected_degree_metric}",
         width="container",
-        height=230,
+        height=340,
     )
     mo.vstack(
         [
             mo.md(f"### Connection inequality: {selected_degree_metric}"),
-            mo.hstack(
+            topic_widget_grid(
                 [
                     mo.stat(
                         f"{selected_degree_summary['gini']:.3f}",
@@ -985,21 +1008,38 @@ def degree_analysis_inequality(
                         label="Connection share held by top 10%",
                         caption=f"{_top_ten['nodes']:,} nodes",
                     ),
+                ]
+            ),
+            mo.hstack(
+                [
+                    mo.vstack(
+                        [
+                            mo.ui.altair_chart(
+                                degree_lorenz_chart,
+                                chart_selection=False,
+                                legend_selection=False,
+                            ),
+                            mo.md(
+                                "The dashed diagonal represents equal counts for every node. The blue Lorenz curve ranks nodes from least to most connected. Gini is twice the area between these curves, without finite-sample correction."
+                            ),
+                        ]
+                    ),
+                    mo.vstack(
+                        [
+                            mo.ui.altair_chart(
+                                degree_top_share_chart,
+                                chart_selection=False,
+                                legend_selection=False,
+                            ),
+                            mo.md(
+                                "Top groups are nested, not additive. Each contains ceil(fraction × node count) nodes ranked independently by the selected relationship; ties at the boundary have equal counts. Hover for actual group sizes."
+                            ),
+                        ]
+                    ),
                 ],
                 widths="equal",
-                wrap=True,
-            ),
-            mo.ui.altair_chart(
-                degree_lorenz_chart, chart_selection=False, legend_selection=False
-            ),
-            mo.md(
-                "The dashed diagonal represents equal counts for every node. The blue Lorenz curve ranks nodes from least to most connected. Gini is twice the area between these curves, without finite-sample correction."
-            ),
-            mo.ui.altair_chart(
-                degree_top_share_chart, chart_selection=False, legend_selection=False
-            ),
-            mo.md(
-                "Top groups are nested, not additive. Each contains ceil(fraction × node count) nodes ranked independently by the selected relationship; ties at the boundary have equal counts. Hover for actual group sizes."
+                align="start",
+                gap=1.5,
             ),
             mo.accordion(
                 {
@@ -1186,12 +1226,20 @@ def compute_node_centrality_scores(network_adjacency, network_node_ids):
 @app.cell(hide_code=True)
 def select_centrality_measure(centrality_methods):
     centrality_method_selector = mo.ui.dropdown(
-        options=centrality_methods, value="PageRank", label="Centrality measure"
+        options=centrality_methods,
+        value="PageRank",
+        label="Centrality measure",
+        full_width=True,
     )
     centrality_top_count = mo.ui.slider(
-        start=10, stop=50, step=10, value=20, label="Top nodes"
+        start=10, stop=50, step=10, value=20, label="Top nodes", full_width=True
     )
-    mo.hstack([centrality_method_selector, centrality_top_count], wrap=True)
+    mo.vstack(
+        [
+            mo.md("### Centrality controls"),
+            topic_widget_grid([centrality_method_selector, centrality_top_count]),
+        ]
+    )
     return centrality_method_selector, centrality_top_count
 
 
@@ -1259,7 +1307,9 @@ def display_node_centrality(
                 ],
             )
             .properties(
-                width="container", height=260, title="Distribution of positive scores"
+                width="container",
+                height=centrality_top_count.value * 20,
+                title="Distribution of positive scores",
             )
         )
         _distribution_outputs.append(
@@ -1268,17 +1318,35 @@ def display_node_centrality(
     mo.vstack(
         [
             mo.md(f"### {_method}"),
-            mo.hstack(
+            topic_widget_grid(
                 [
                     mo.stat(f"{len(_values):,}", label="Nodes scored"),
                     mo.stat(f"{np.count_nonzero(_values == 0):,}", label="Zero scores"),
                     mo.stat(f"{_top_fraction:.1%}", label="Score share held by top 1%"),
+                ]
+            ),
+            mo.hstack(
+                [
+                    mo.vstack(
+                        [
+                            mo.ui.altair_chart(
+                                _bar, chart_selection=False, legend_selection=False
+                            ),
+                        ]
+                    ),
+                    mo.vstack(
+                        _distribution_outputs
+                        or [
+                            mo.md(
+                                "No positive scores are available for a logarithmic distribution."
+                            ),
+                        ]
+                    ),
                 ],
                 widths="equal",
-                wrap=True,
+                align="start",
+                gap=1.5,
             ),
-            mo.ui.altair_chart(_bar, chart_selection=False, legend_selection=False),
-            *_distribution_outputs,
             mo.md(
                 "Zero scores are counted above and excluded from the logarithmic histogram. Top 1% uses ceil(0.01 × N) nodes. Equal scores are ordered by node ID for display; ranks used below average ties."
             ),
@@ -1590,7 +1658,7 @@ def display_component_overview(component_summary, network_structure_totals):
     _strong = component_summary.filter(pl.col("kind") == "Strong").row(0, named=True)
     mo.vstack(
         [
-            mo.hstack(
+            topic_widget_grid(
                 [
                     mo.stat(f"{_weak['components']:,}", label="Weak components"),
                     mo.stat(f"{_strong['components']:,}", label="Strong components"),
@@ -1604,9 +1672,7 @@ def display_component_overview(component_summary, network_structure_totals):
                         label="Isolates",
                         caption="No non-self incoming or outgoing edges",
                     ),
-                ],
-                widths="equal",
-                wrap=True,
+                ]
             ),
             mo.ui.table(
                 component_summary,
@@ -1635,8 +1701,14 @@ def select_component_connectivity():
         options=["Weak", "Strong"],
         value="Strong",
         label="Component definition",
+        full_width=True,
     )
-    component_type_selector
+    mo.vstack(
+        [
+            mo.md("### Component controls"),
+            topic_widget_grid([component_type_selector]),
+        ]
+    )
     return (component_type_selector,)
 
 
@@ -1671,7 +1743,7 @@ def display_component_size_distributions(
         .properties(
             title=f"Largest {_kind.lower()} components (up to 10)",
             width="container",
-            height=280,
+            height=300,
         )
     )
     component_size_chart = (
@@ -1705,11 +1777,30 @@ def display_component_size_distributions(
     )
     mo.vstack(
         [
-            mo.ui.altair_chart(
-                component_rank_chart, chart_selection=False, legend_selection=False
-            ),
-            mo.ui.altair_chart(
-                component_size_chart, chart_selection=False, legend_selection=False
+            mo.hstack(
+                [
+                    mo.vstack(
+                        [
+                            mo.ui.altair_chart(
+                                component_rank_chart,
+                                chart_selection=False,
+                                legend_selection=False,
+                            ),
+                        ]
+                    ),
+                    mo.vstack(
+                        [
+                            mo.ui.altair_chart(
+                                component_size_chart,
+                                chart_selection=False,
+                                legend_selection=False,
+                            ),
+                        ]
+                    ),
+                ],
+                widths="equal",
+                align="start",
+                gap=1.5,
             ),
             mo.md(
                 "Each dot represents an exact component size, not a histogram bin. A single component appears as one dot. Component IDs are their smallest original node ID; ranks sort by size, then ID."
@@ -1788,7 +1879,7 @@ def display_global_reciprocity(
     mo.vstack(
         [
             mo.md("### Reciprocity across the network"),
-            mo.hstack(
+            topic_widget_grid(
                 [
                     mo.stat(
                         _edge_rate,
@@ -1800,9 +1891,7 @@ def display_global_reciprocity(
                         label="Connected-pair reciprocity",
                         caption=f"{_totals['mutual_pairs']:,} / {_totals['connected_pairs']:,} connected pairs",
                     ),
-                ],
-                widths="equal",
-                wrap=True,
+                ]
             ),
             mo.md(
                 f"There are **{_totals['mutual_pairs']:,} mutual pairs** and **{_totals['one_way_pairs']:,} one-way pairs**. If R is the mutual-pair count and U the one-way-pair count, directed-edge reciprocity is **2R / (2R + U)**, while connected-pair reciprocity is **R / (R + U)**. Pairs with no edge are outside both denominators. These rates are different views of the same relationships, not independent results."
@@ -1961,6 +2050,7 @@ def select_ego_node(nodes_lf):
         options=ego_nodes,
         value=ego_nodes[0],
         label="Choose an ego node",
+        full_width=True,
     )
     return (ego_node_dropdown,)
 
@@ -1977,19 +2067,25 @@ def control_ego_network_visualization(
     mo.vstack(
         [
             mo.md("### Network controls"),
-            mo.hstack(
-                [ego_node_dropdown, ego_network_relationship], wrap=True, widths="equal"
+            mo.md("#### Nodes and filters"),
+            topic_widget_grid(
+                [
+                    ego_node_dropdown,
+                    ego_network_relationship,
+                    ego_network_feature,
+                    ego_network_node_limit,
+                ]
             ),
-            ego_network_feature,
-            ego_network_node_limit,
-            mo.hstack([ego_network_neighbor_edges, ego_network_labels], wrap=True),
+            mo.md("#### Display options"),
+            topic_widget_grid([ego_network_neighbor_edges, ego_network_labels]),
             mo.md(
                 "Features are sorted by neighbor count, highest first. Search features recorded "
                 "among this ego's incoming or outgoing neighbors. The ego remains visible even "
                 "if it does not have the chosen feature. Nodes without recorded features match "
                 "only **All features**."
             ),
-        ]
+        ],
+        gap=1,
     )
     return
 
@@ -2046,6 +2142,7 @@ def define_ego_network_controls():
         ],
         value="Following (outgoing)",
         label="Relationships to include",
+        full_width=True,
     )
     ego_network_node_limit = mo.ui.slider(
         start=10,
@@ -2053,6 +2150,7 @@ def define_ego_network_controls():
         step=10,
         value=80,
         label="Maximum displayed nodes (including ego)",
+        full_width=True,
     )
     ego_network_neighbor_edges = mo.ui.checkbox(
         value=True,
