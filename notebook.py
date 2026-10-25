@@ -2279,6 +2279,1348 @@ def display_node_reciprocity_distributions(
 
 
 @app.cell(hide_code=True)
+def describe_combined_feature_pagerank():
+    mo.md(r"""
+    ## 4. Feature PageRank in the combined network
+
+    This graph contains **account nodes** and **feature nodes**. It retains directed
+    Twitter following edges and adds both account → feature and feature → account
+    edges for every recorded feature membership. The two node types have separate
+    index ranges, so equal numeric IDs never merge an account with a feature.
+
+    At an account with both kinds of edges, the walk splits its probability between
+    following edges and feature memberships. Within each kind, neighbors are equally
+    likely. If only one kind exists, the walk uses it. A feature leads uniformly to
+    accounts that have it. PageRank uses **85% continuation** and **15% restart**;
+    restarts and dangling-node mass go uniformly to accounts.
+
+    Compare the resulting feature ranking with simple frequency. Scores describe
+    connectivity under this walk, not causal influence. Missing annotations are
+    unobserved data, not evidence that an account lacks a feature.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def control_combined_feature_pagerank():
+    feature_pagerank_social_share = mo.ui.slider(
+        start=0.0,
+        stop=1.0,
+        step=0.1,
+        value=0.5,
+        full_width=True,
+        label="Share of account walk on following edges",
+    )
+    feature_pagerank_top_count = mo.ui.slider(
+        start=10,
+        stop=50,
+        step=10,
+        value=20,
+        full_width=True,
+        label="Top features to display",
+    )
+    feature_pagerank_min_accounts = mo.ui.slider(
+        start=1,
+        stop=100,
+        step=1,
+        value=1,
+        full_width=True,
+        label="Minimum accounts with feature (display only)",
+    )
+    mo.vstack(
+        [
+            mo.md("### Feature ranking controls"),
+            topic_widget_grid(
+                [
+                    feature_pagerank_social_share,
+                    feature_pagerank_top_count,
+                    feature_pagerank_min_accounts,
+                ]
+            ),
+            mo.md(
+                "The walk-share control changes the model and recomputes PageRank. "
+                "The other controls only change the displayed results. The complementary "
+                "share goes to features; accounts with only one edge type use that type."
+            ),
+        ]
+    )
+    return (
+        feature_pagerank_min_accounts,
+        feature_pagerank_social_share,
+        feature_pagerank_top_count,
+    )
+
+
+@app.cell(hide_code=True)
+def define_combined_feature_pagerank(sparse):
+    def prepare_feature_pagerank_walk(social_adjacency, incidence):
+        """Cache row-normalized blocks for an account/account/feature random walk."""
+        social = sparse.csr_array(social_adjacency, dtype=np.float64)
+        memberships = sparse.csr_array(incidence, dtype=np.float64)
+        if social.shape[0] == 0 or social.shape[0] != social.shape[1]:
+            raise ValueError("The social graph must be nonempty and square")
+        if memberships.shape[0] != social.shape[0]:
+            raise ValueError("Membership rows must match the account graph")
+        if np.any(social.data < 0) or np.any(memberships.data < 0):
+            raise ValueError("Graph weights cannot be negative")
+        outgoing = np.asarray(social.sum(axis=1)).ravel()
+        account_features = np.asarray(memberships.sum(axis=1)).ravel()
+        feature_accounts = np.asarray(memberships.sum(axis=0)).ravel()
+        social_inverse = np.divide(
+            1.0, outgoing, out=np.zeros_like(outgoing), where=outgoing > 0
+        )
+        account_inverse = np.divide(
+            1.0,
+            account_features,
+            out=np.zeros_like(account_features),
+            where=account_features > 0,
+        )
+        feature_inverse = np.divide(
+            1.0,
+            feature_accounts,
+            out=np.zeros_like(feature_accounts),
+            where=feature_accounts > 0,
+        )
+        return {
+            "social_transpose": social.multiply(social_inverse[:, None]).T.tocsr(),
+            "account_to_feature_transpose": memberships.multiply(
+                account_inverse[:, None]
+            ).T.tocsr(),
+            "feature_to_account_transpose": memberships.T.multiply(
+                feature_inverse[:, None]
+            ).T.tocsr(),
+            "has_social": outgoing > 0,
+            "has_features": account_features > 0,
+            "feature_dangling": feature_accounts == 0,
+            "accounts": social.shape[0],
+            "features": memberships.shape[1],
+        }
+
+    def compute_combined_feature_pagerank(
+        walk, social_share=0.5, damping=0.85, tolerance=1e-10, max_iterations=500
+    ):
+        """Compute typed PageRank with uniform-account restarts and branch fallback."""
+        if not 0 <= social_share <= 1 or not 0 < damping < 1:
+            raise ValueError("Walk share must be in [0, 1] and damping in (0, 1)")
+        social_weight = np.where(
+            walk["has_social"] & walk["has_features"],
+            social_share,
+            walk["has_social"].astype(float),
+        )
+        feature_weight = np.where(walk["has_features"], 1.0 - social_weight, 0.0)
+        dangling_accounts = ~(walk["has_social"] | walk["has_features"])
+        accounts = np.full(walk["accounts"], 1.0 / walk["accounts"])
+        features = np.zeros(walk["features"])
+
+        def step(account_mass, feature_mass):
+            dangling_mass = float(
+                account_mass[dangling_accounts].sum()
+                + feature_mass[walk["feature_dangling"]].sum()
+            )
+            next_accounts = (
+                damping
+                * (
+                    walk["social_transpose"] @ (account_mass * social_weight)
+                    + walk["feature_to_account_transpose"] @ feature_mass
+                )
+                + ((1.0 - damping) + damping * dangling_mass) / walk["accounts"]
+            )
+            next_features = damping * (
+                walk["account_to_feature_transpose"] @ (account_mass * feature_weight)
+            )
+            return next_accounts, next_features
+
+        for iteration in range(1, max_iterations + 1):
+            next_accounts, next_features = step(accounts, features)
+            change = float(
+                np.abs(next_accounts - accounts).sum()
+                + np.abs(next_features - features).sum()
+            )
+            accounts, features = next_accounts, next_features
+            if change <= tolerance:
+                break
+        check_accounts, check_features = step(accounts, features)
+        residual = float(
+            np.abs(check_accounts - accounts).sum()
+            + np.abs(check_features - features).sum()
+        )
+        diagnostics = {
+            "iterations": iteration,
+            "converged": residual <= tolerance,
+            "l1_residual": residual,
+            "total_mass": float(accounts.sum() + features.sum()),
+            "account_mass": float(accounts.sum()),
+            "feature_mass": float(features.sum()),
+            "damping": damping,
+            "social_share": social_share,
+        }
+        return accounts, features, diagnostics
+
+    return compute_combined_feature_pagerank, prepare_feature_pagerank_walk
+
+
+@app.cell(hide_code=True)
+def build_combined_account_feature_graph(
+    feats_lf,
+    network_adjacency,
+    network_node_ids,
+    nodes_lf,
+    prepare_feature_pagerank_walk,
+    sparse,
+):
+    feature_pagerank_catalog = feats_lf.select("id", "name").sort("id").collect()
+    _feature_ids = feature_pagerank_catalog["id"].to_numpy()
+    _memberships = (
+        nodes_lf.select("node", "features")
+        .explode("features")
+        .filter(pl.col("features").is_not_null())
+        .unique(["node", "features"])
+        .collect()
+    )
+    _account_indices = np.searchsorted(
+        network_node_ids, _memberships["node"].to_numpy()
+    )
+    _feature_indices = np.searchsorted(
+        _feature_ids, _memberships["features"].to_numpy()
+    )
+    if (
+        np.any(_account_indices >= network_node_ids.size)
+        or np.any(_feature_indices >= _feature_ids.size)
+        or not np.array_equal(
+            network_node_ids[_account_indices], _memberships["node"].to_numpy()
+        )
+        or not np.array_equal(
+            _feature_ids[_feature_indices], _memberships["features"].to_numpy()
+        )
+    ):
+        raise ValueError("Every membership must identify a known account and feature")
+    feature_account_incidence = sparse.csr_array(
+        (
+            np.ones(_memberships.height, dtype=bool),
+            (_account_indices, _feature_indices),
+        ),
+        shape=(network_node_ids.size, _feature_ids.size),
+    )
+    # Account indices come first; feature indices are offset by the account count.
+    feature_pagerank_adjacency = sparse.block_array(
+        [
+            [network_adjacency, feature_account_incidence],
+            [
+                feature_account_incidence.T,
+                sparse.csr_array((_feature_ids.size, _feature_ids.size), dtype=bool),
+            ],
+        ],
+        format="csr",
+    )
+    feature_pagerank_vertices = pl.concat(
+        [
+            pl.DataFrame(
+                {
+                    "id": network_node_ids,
+                    "node_type": ["account"] * network_node_ids.size,
+                }
+            ),
+            feature_pagerank_catalog.select("id").with_columns(
+                pl.lit("feature").alias("node_type")
+            ),
+        ]
+    ).with_row_index("graph_index")
+    feature_pagerank_walk = prepare_feature_pagerank_walk(
+        network_adjacency, feature_account_incidence
+    )
+    feature_pagerank_account_counts = np.asarray(
+        feature_account_incidence.sum(axis=0)
+    ).ravel()
+    feature_pagerank_graph_summary = {
+        "accounts": network_node_ids.size,
+        "features": _feature_ids.size,
+        "memberships": int(feature_account_incidence.nnz),
+        "social_edges": int(network_adjacency.nnz),
+        "combined_edges": int(feature_pagerank_adjacency.nnz),
+        "annotated_accounts": int(
+            np.count_nonzero(feature_pagerank_walk["has_features"])
+        ),
+        "observed_features": int(np.count_nonzero(feature_pagerank_account_counts)),
+    }
+    return (
+        feature_account_incidence,
+        feature_pagerank_account_counts,
+        feature_pagerank_catalog,
+        feature_pagerank_graph_summary,
+        feature_pagerank_walk,
+    )
+
+
+@app.cell(hide_code=True)
+def compute_feature_pagerank_ranking(
+    compute_combined_feature_pagerank,
+    feature_pagerank_account_counts,
+    feature_pagerank_catalog,
+    feature_pagerank_graph_summary,
+    feature_pagerank_social_share,
+    feature_pagerank_walk,
+):
+    feature_pagerank_account_scores, _feature_scores, feature_pagerank_diagnostics = (
+        compute_combined_feature_pagerank(
+            feature_pagerank_walk,
+            social_share=feature_pagerank_social_share.value,
+        )
+    )
+    mo.stop(
+        not feature_pagerank_diagnostics["converged"],
+        mo.md(f"Feature PageRank did not converge: {feature_pagerank_diagnostics}"),
+    )
+    _feature_mass = feature_pagerank_diagnostics["feature_mass"]
+    _membership_total = feature_pagerank_graph_summary["memberships"]
+    feature_pagerank_scores = (
+        feature_pagerank_catalog.with_columns(
+            pl.Series("account_count", feature_pagerank_account_counts),
+            pl.Series("pagerank", _feature_scores),
+            pl.Series(
+                "feature_share",
+                _feature_scores / _feature_mass
+                if _feature_mass > 0
+                else np.zeros_like(_feature_scores),
+            ),
+        )
+        .filter(pl.col("account_count") > 0)
+        .with_columns(
+            (
+                pl.col("account_count") / feature_pagerank_graph_summary["accounts"]
+            ).alias("account_coverage"),
+            (pl.col("account_count") / _membership_total).alias("frequency_share"),
+            pl.col("account_count")
+            .rank(method="average", descending=True)
+            .alias("frequency_rank"),
+            pl.col("pagerank")
+            .rank(method="average", descending=True)
+            .alias("pagerank_rank"),
+        )
+        .with_columns(
+            (pl.col("feature_share") / pl.col("frequency_share")).alias("share_lift"),
+            (pl.col("frequency_rank") - pl.col("pagerank_rank")).alias("rank_gain"),
+        )
+        .sort(["pagerank", "id"], descending=[True, False])
+    )
+    _rank_a = feature_pagerank_scores["frequency_rank"].to_numpy()
+    _rank_b = feature_pagerank_scores["pagerank_rank"].to_numpy()
+    feature_pagerank_frequency_correlation = (
+        float(np.corrcoef(_rank_a, _rank_b)[0, 1])
+        if len(_rank_a) > 1 and np.std(_rank_a) > 0 and np.std(_rank_b) > 0
+        else None
+    )
+    return (
+        feature_pagerank_account_scores,
+        feature_pagerank_diagnostics,
+        feature_pagerank_frequency_correlation,
+        feature_pagerank_scores,
+    )
+
+
+@app.cell(hide_code=True)
+def display_feature_pagerank_analysis(
+    feature_pagerank_diagnostics,
+    feature_pagerank_frequency_correlation,
+    feature_pagerank_graph_summary,
+    feature_pagerank_min_accounts,
+    feature_pagerank_scores,
+    feature_pagerank_top_count,
+):
+    _summary = feature_pagerank_graph_summary
+    _diagnostics = feature_pagerank_diagnostics
+    _eligible = feature_pagerank_scores.filter(
+        pl.col("account_count") >= feature_pagerank_min_accounts.value
+    )
+    _top = _eligible.head(feature_pagerank_top_count.value)
+    _correlation = (
+        f"{feature_pagerank_frequency_correlation:.3f}"
+        if feature_pagerank_frequency_correlation is not None
+        else "Undefined"
+    )
+    mo.output.append(
+        mo.vstack(
+            [
+                topic_widget_grid(
+                    [
+                        mo.stat(
+                            f"{_summary['accounts']:,}",
+                            label="Account nodes",
+                            caption=f"{_summary['annotated_accounts']:,} with recorded features",
+                        ),
+                        mo.stat(
+                            f"{_summary['observed_features']:,}",
+                            label="Observed feature nodes",
+                            caption=f"{_summary['features']:,} labels in catalog",
+                        ),
+                        mo.stat(
+                            f"{_summary['combined_edges']:,}",
+                            label="Combined directed edges",
+                            caption=f"{_summary['social_edges']:,} social + 2 × {_summary['memberships']:,} memberships",
+                        ),
+                        mo.stat(
+                            _correlation,
+                            label="Rank correlation with frequency",
+                            caption="Spearman, all observed features; average ranks for ties",
+                        ),
+                    ]
+                ),
+                mo.md(
+                    f"Converged in **{_diagnostics['iterations']} iterations**; L1 residual **{_diagnostics['l1_residual']:.2e}**. "
+                    f"Accounts hold **{_diagnostics['account_mass']:.2%}** of PageRank mass and features **{_diagnostics['feature_mass']:.2%}**. "
+                    "Feature share below is normalized across all feature nodes before display filters. "
+                    "Unobserved catalog features have zero score and are excluded from rankings."
+                ),
+            ]
+        )
+    )
+    mo.stop(
+        _diagnostics["feature_mass"] <= 0,
+        mo.md(
+            "No PageRank mass reaches features at this walk share. Reduce the share on following edges."
+        ),
+    )
+    mo.stop(
+        _top.is_empty(),
+        mo.md("No features meet the minimum account count. Lower the display filter."),
+    )
+    feature_pagerank_top_chart = (
+        alt.Chart(_top)
+        .mark_bar(color="#2563a6")
+        .encode(
+            x=alt.X(
+                "feature_share:Q",
+                title="Share of feature PageRank",
+                axis=alt.Axis(format=".1%"),
+            ),
+            y=alt.Y(
+                "name:N",
+                title=None,
+                sort=_top["name"].to_list(),
+                axis=alt.Axis(labelLimit=180),
+            ),
+            tooltip=[
+                alt.Tooltip("name:N", title="Feature"),
+                alt.Tooltip("id:Q", title="Feature ID", format="d"),
+                alt.Tooltip(
+                    "feature_share:Q", title="Feature PageRank share", format=".4%"
+                ),
+                alt.Tooltip("account_count:Q", title="Accounts", format=",d"),
+                alt.Tooltip(
+                    "share_lift:Q", title="Share / frequency share", format=".2f"
+                ),
+                alt.Tooltip(
+                    "rank_gain:Q", title="Rank gain over frequency", format=",.1f"
+                ),
+            ],
+        )
+        .properties(
+            title="Top features by combined PageRank",
+            width="container",
+            height=max(300, _top.height * 22),
+        )
+    )
+    _positive = _eligible.filter(pl.col("feature_share") > 0)
+    _stride = max(1, int(np.ceil(_positive.height / 2500)))
+    _sample = (
+        _positive.sort("id")
+        .with_row_index("sample_index")
+        .filter(pl.col("sample_index") % _stride == 0)
+        .drop("sample_index")
+    )
+    _sample = (
+        pl.concat(
+            [
+                _sample,
+                _top,
+                _eligible.sort(["account_count", "id"], descending=[True, False]).head(
+                    20
+                ),
+            ]
+        )
+        .unique("id")
+        .filter(pl.col("feature_share") > 0)
+    )
+    _sample = _sample.with_columns(
+        pl.when(pl.col("id").is_in(_top["id"].implode()))
+        .then(pl.lit("Top features"))
+        .otherwise(pl.lit("Other sampled features"))
+        .alias("feature_group")
+    )
+    feature_pagerank_frequency_chart = (
+        alt.Chart(_sample)
+        .mark_circle(size=35, opacity=0.6)
+        .encode(
+            x=alt.X(
+                "account_count:Q",
+                title="Accounts with feature (log scale)",
+                scale=alt.Scale(type="log"),
+            ),
+            y=alt.Y(
+                "feature_share:Q",
+                title="Feature PageRank share (log scale)",
+                scale=alt.Scale(type="log"),
+                axis=alt.Axis(format=".1e", tickCount=6),
+            ),
+            color=alt.Color(
+                "feature_group:N",
+                title="Feature group",
+                scale=alt.Scale(
+                    domain=["Other sampled features", "Top features"],
+                    range=["#2563a6", "#f59e0b"],
+                ),
+                legend=alt.Legend(orient="bottom"),
+            ),
+            tooltip=[
+                alt.Tooltip("name:N", title="Feature"),
+                alt.Tooltip("account_count:Q", title="Accounts", format=",d"),
+                alt.Tooltip(
+                    "feature_share:Q", title="Feature PageRank share", format=".4%"
+                ),
+                alt.Tooltip(
+                    "share_lift:Q", title="Share / frequency share", format=".2f"
+                ),
+            ],
+        )
+        .properties(
+            title="Frequency versus combined PageRank",
+            width="container",
+            height=max(300, _top.height * 22),
+        )
+        .interactive()
+    )
+    mo.vstack(
+        [
+            mo.hstack(
+                [
+                    mo.vstack(
+                        [
+                            mo.ui.altair_chart(
+                                feature_pagerank_top_chart,
+                                chart_selection=False,
+                                legend_selection=False,
+                            )
+                        ]
+                    ),
+                    mo.vstack(
+                        [
+                            mo.ui.altair_chart(
+                                feature_pagerank_frequency_chart,
+                                chart_selection=False,
+                                legend_selection=False,
+                            )
+                        ]
+                    ),
+                ],
+                widths="equal",
+                align="start",
+                gap=1.5,
+            ),
+            mo.md(
+                f"Showing **{_top.height:,} of {_eligible.height:,} eligible features**. "
+                f"The scatter displays **{_sample.height:,} features**, using a deterministic sample plus the highest PageRank and frequency features. "
+                "The correlation uses every observed feature, regardless of display filters. "
+                "A share lift above 1 means more feature PageRank share than its share of all recorded memberships; "
+                "it is a descriptive comparison, not a significance test."
+            ),
+            mo.ui.table(
+                _top.select(
+                    "id",
+                    "name",
+                    "account_count",
+                    "account_coverage",
+                    "pagerank",
+                    "feature_share",
+                    "frequency_share",
+                    "pagerank_rank",
+                    "frequency_rank",
+                    "rank_gain",
+                    "share_lift",
+                ),
+                selection=None,
+                pagination=True,
+                page_size=10,
+                show_data_types=False,
+                show_column_summaries=False,
+                format_mapping={
+                    "account_coverage": "{:.2%}",
+                    "pagerank": "{:.6g}",
+                    "feature_share": "{:.4%}",
+                    "frequency_share": "{:.4%}",
+                    "share_lift": "{:.2f}",
+                    "rank_gain": "{:+,.1f}",
+                },
+            ),
+            mo.accordion(
+                {
+                    "All feature scores": mo.ui.table(
+                        feature_pagerank_scores,
+                        selection=None,
+                        pagination=True,
+                        page_size=10,
+                        show_data_types=False,
+                        show_column_summaries=False,
+                        format_mapping={
+                            "feature_share": "{:.4%}",
+                            "share_lift": "{:.2f}",
+                            "pagerank": "{:.6g}",
+                        },
+                    )
+                }
+            ),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def control_top_feature_network():
+    feature_network_accounts_per_feature = mo.ui.slider(
+        start=1,
+        stop=5,
+        step=1,
+        value=3,
+        full_width=True,
+        label="Accounts per top feature",
+    )
+    feature_network_account_ranking = mo.ui.dropdown(
+        options=["Combined PageRank", "Total connections"],
+        value="Combined PageRank",
+        full_width=True,
+        label="Select connected accounts by",
+    )
+    feature_network_social_edges = mo.ui.checkbox(
+        value=True, label="Show account following edges"
+    )
+    feature_network_account_labels = mo.ui.checkbox(
+        value=False, label="Show account IDs on the plot"
+    )
+    mo.vstack(
+        [
+            mo.md("### Network of top features and accounts"),
+            topic_widget_grid(
+                [
+                    feature_network_accounts_per_feature,
+                    feature_network_account_ranking,
+                    feature_network_social_edges,
+                    feature_network_account_labels,
+                ]
+            ),
+            mo.md(
+                "Uses the **Top features to display** and **Minimum accounts with feature** controls above. "
+                "For each top-ranked feature, select accounts that have it; shared accounts appear once. "
+                "PageRank selection uses account scores from the combined graph. Connection-count selection "
+                "uses incoming + outgoing social edges, with PageRank and node ID breaking ties. "
+                "Scores are computed on the full combined graph, not recomputed on this displayed subset."
+            ),
+        ]
+    )
+    return (
+        feature_network_account_labels,
+        feature_network_account_ranking,
+        feature_network_accounts_per_feature,
+        feature_network_social_edges,
+    )
+
+
+@app.function(hide_code=True)
+def build_top_feature_network_data(
+    feature_scores,
+    account_metadata,
+    social_adjacency,
+    incidence_columns,
+    catalog_ids,
+    top_count,
+    accounts_per_feature,
+    ranking="Combined PageRank",
+    include_social=True,
+):
+    """Select top features and ranked member accounts, retaining all induced memberships."""
+    top = feature_scores.sort(["pagerank", "id"], descending=[True, False]).head(
+        top_count
+    )
+    if top.is_empty():
+        return {
+            "nodes": [],
+            "links": [],
+            "arrows": [],
+            "features": 0,
+            "accounts": 0,
+            "memberships": 0,
+            "social_edges": 0,
+        }
+    account_ids = account_metadata["node"].to_numpy()
+    account_scores = account_metadata["combined_pagerank"].to_numpy()
+    degree = (
+        account_metadata["in_degree"] + account_metadata["out_degree"]
+    ).to_numpy()
+    feature_ids = top["id"].to_numpy()
+    feature_columns = np.searchsorted(catalog_ids, feature_ids)
+    if np.any(feature_columns >= len(catalog_ids)) or not np.array_equal(
+        catalog_ids[feature_columns], feature_ids
+    ):
+        raise ValueError("Selected features must exist in the membership matrix")
+    selected_accounts = set()
+    for column in feature_columns:
+        candidates = incidence_columns.indices[
+            incidence_columns.indptr[column] : incidence_columns.indptr[column + 1]
+        ]
+        if ranking == "Combined PageRank":
+            order = np.lexsort(
+                (
+                    account_ids[candidates],
+                    -degree[candidates],
+                    -account_scores[candidates],
+                )
+            )
+        elif ranking == "Total connections":
+            order = np.lexsort(
+                (
+                    account_ids[candidates],
+                    -account_scores[candidates],
+                    -degree[candidates],
+                )
+            )
+        else:
+            raise ValueError("Unknown account ranking")
+        selected_accounts.update(
+            int(index) for index in candidates[order[:accounts_per_feature]]
+        )
+    account_indices = np.array(sorted(selected_accounts), dtype=np.int64)
+    feature_keys = [("feature", int(feature_id)) for feature_id in feature_ids]
+    account_keys = [
+        ("account", int(account_ids[index])) for index in account_indices
+    ]
+    graph = nx.DiGraph()
+    graph.add_nodes_from(feature_keys + account_keys)
+    memberships = incidence_columns[account_indices, :][:, feature_columns].tocoo()
+    membership_edges = [
+        (account_keys[int(row)], feature_keys[int(column)])
+        for row, column in zip(memberships.row, memberships.col)
+    ]
+    for account_key, feature_key in membership_edges:
+        graph.add_edge(account_key, feature_key)
+        graph.add_edge(feature_key, account_key)
+    social_edges = set()
+    if include_social:
+        social = social_adjacency[account_indices, :][:, account_indices].tocoo()
+        social_edges = {
+            (account_keys[int(source)], account_keys[int(target)])
+            for source, target in zip(social.row, social.col)
+            if source != target
+        }
+        graph.add_edges_from(sorted(social_edges))
+    positions = nx.spring_layout(graph.to_undirected(), seed=42, iterations=100)
+    max_score = max(
+        float(top["pagerank"].max()),
+        float(account_scores[account_indices].max())
+        if account_indices.size
+        else 0.0,
+    )
+    nodes = []
+    for row in top.iter_rows(named=True):
+        key = ("feature", int(row["id"]))
+        label = row["name"] if len(row["name"]) <= 28 else row["name"][:27] + "…"
+        nodes.append(
+            {
+                "key": f"feature:{row['id']}",
+                "id": str(row["id"]),
+                "label": label,
+                "name": row["name"],
+                "kind": "Feature",
+                "x": float(positions[key][0]),
+                "y": float(positions[key][1]),
+                "pagerank": row["pagerank"],
+                "details": f"{row['account_count']:,} accounts; {row['feature_share']:.4%} of feature PageRank",
+                "size": float(90 + 400 * np.sqrt(row["pagerank"] / max_score))
+                if max_score
+                else 90.0,
+            }
+        )
+    for index, key in zip(account_indices, account_keys):
+        row = account_metadata.row(int(index), named=True)
+        nodes.append(
+            {
+                "key": f"account:{row['node']}",
+                "id": str(row["node"]),
+                "label": str(row["node"]),
+                "name": str(row["node"]),
+                "kind": "Account",
+                "x": float(positions[key][0]),
+                "y": float(positions[key][1]),
+                "pagerank": row["combined_pagerank"],
+                "details": f"Incoming: {row['in_degree']:,}; outgoing: {row['out_degree']:,}",
+                "size": float(
+                    90 + 400 * np.sqrt(row["combined_pagerank"] / max_score)
+                )
+                if max_score
+                else 90.0,
+            }
+        )
+    names = {(row["kind"].lower(), int(row["id"])): row["name"] for row in nodes}
+    links, arrows = [], []
+    for account_key, feature_key in membership_edges:
+        start, end = positions[account_key], positions[feature_key]
+        links.append(
+            {
+                "source": f"account:{account_key[1]}",
+                "target": f"feature:{feature_key[1]}",
+                "source_label": names[account_key],
+                "target_label": names[feature_key],
+                "edge_type": "Account–feature membership",
+                "direction": "Both directions",
+                "x": float(start[0]),
+                "y": float(start[1]),
+                "x2": float(end[0]),
+                "y2": float(end[1]),
+            }
+        )
+    for source, target in sorted(social_edges):
+        start, end = positions[source], positions[target]
+        delta = end - start
+        length = float(np.linalg.norm(delta))
+        mutual = (target, source) in social_edges
+        edge = {
+            "source": f"account:{source[1]}",
+            "target": f"account:{target[1]}",
+            "source_label": names[source],
+            "target_label": names[target],
+            "edge_type": "Account follows account",
+            "direction": "Mutual" if mutual else "One-way",
+            "x": float(start[0]),
+            "y": float(start[1]),
+            "x2": float(end[0]),
+            "y2": float(end[1]),
+        }
+        if not mutual or source < target:
+            links.append(edge)
+        point = end - delta * min(0.045 / max(length, 1e-9), 0.35)
+        arrows.append({**edge, "x": float(point[0]), "y": float(point[1])})
+    return {
+        "nodes": nodes,
+        "links": links,
+        "arrows": arrows,
+        "features": top.height,
+        "accounts": len(account_indices),
+        "memberships": len(membership_edges),
+        "social_edges": len(social_edges),
+    }
+
+
+@app.cell(hide_code=True)
+def index_feature_network_memberships(feature_account_incidence):
+    feature_network_incidence_columns = feature_account_incidence.tocsc()
+    return (feature_network_incidence_columns,)
+
+
+@app.cell(hide_code=True)
+def compute_top_feature_network(
+    centrality_scores,
+    feature_network_account_ranking,
+    feature_network_accounts_per_feature,
+    feature_network_incidence_columns,
+    feature_network_social_edges,
+    feature_pagerank_account_scores,
+    feature_pagerank_catalog,
+    feature_pagerank_min_accounts,
+    feature_pagerank_scores,
+    feature_pagerank_top_count,
+    network_adjacency,
+    network_node_ids,
+):
+    _accounts = centrality_scores.select("node", "in_degree", "out_degree").sort("node")
+    if not np.array_equal(_accounts["node"].to_numpy(), network_node_ids):
+        raise ValueError("Account score rows must align with the graph's account IDs")
+    _accounts = _accounts.with_columns(
+        pl.Series("combined_pagerank", feature_pagerank_account_scores)
+    )
+    feature_network_plot_data = build_top_feature_network_data(
+        feature_pagerank_scores.filter(
+            pl.col("account_count") >= feature_pagerank_min_accounts.value
+        ),
+        _accounts,
+        network_adjacency,
+        feature_network_incidence_columns,
+        feature_pagerank_catalog["id"].to_numpy(),
+        feature_pagerank_top_count.value,
+        feature_network_accounts_per_feature.value,
+        feature_network_account_ranking.value,
+        feature_network_social_edges.value,
+    )
+    return (feature_network_plot_data,)
+
+
+@app.cell(hide_code=True)
+def display_top_feature_network(
+    feature_network_account_labels,
+    feature_network_plot_data,
+    feature_pagerank_diagnostics,
+):
+    _network = feature_network_plot_data
+    mo.stop(
+        feature_pagerank_diagnostics["feature_mass"] <= 0,
+        mo.md(
+            "No PageRank mass reaches features. Reduce the following-edge walk share above."
+        ),
+    )
+    mo.stop(
+        not _network["nodes"],
+        mo.md(
+            "No features meet the selected minimum account count. Lower the display filter above."
+        ),
+    )
+    _x = alt.X("x:Q", axis=None, scale=alt.Scale(zero=False, padding=40))
+    _y = alt.Y("y:Q", axis=None, scale=alt.Scale(zero=False, padding=40))
+    _links = (
+        alt.Chart(alt.Data(values=_network["links"]))
+        .mark_rule(opacity=0.4, strokeWidth=1)
+        .encode(
+            x=_x,
+            y=_y,
+            x2="x2:Q",
+            y2="y2:Q",
+            color=alt.Color(
+                "edge_type:N",
+                title="Connection type",
+                scale=alt.Scale(
+                    domain=["Account–feature membership", "Account follows account"],
+                    range=["#8b5cf6", "#94a3b8"],
+                ),
+                legend=alt.Legend(orient="bottom"),
+            ),
+            tooltip=[
+                alt.Tooltip("source_label:N", title="From / account"),
+                alt.Tooltip("target_label:N", title="To / feature"),
+                alt.Tooltip("edge_type:N", title="Connection"),
+                alt.Tooltip("direction:N", title="Direction"),
+            ],
+        )
+    )
+    _arrows = (
+        alt.Chart(alt.Data(values=_network["arrows"]))
+        .mark_point(
+            shape="triangle-up",
+            color="#94a3b8",
+            filled=True,
+            size=28,
+            opacity=0.75,
+            angle=alt.ExprRef(
+                expr="atan2(scale('x', datum.x2) - scale('x', datum.x), scale('y', datum.y) - scale('y', datum.y2)) * 180 / PI"
+            ),
+        )
+        .encode(
+            x=_x,
+            y=_y,
+            tooltip=[
+                alt.Tooltip("source_label:N", title="Follower"),
+                alt.Tooltip("target_label:N", title="Followed account"),
+            ],
+        )
+    )
+    _node_base = alt.Chart(alt.Data(values=_network["nodes"]))
+    _nodes = _node_base.mark_point(
+        filled=True, stroke="white", strokeWidth=1.3, opacity=1
+    ).encode(
+        x=_x,
+        y=_y,
+        size=alt.Size("size:Q", scale=None, legend=None),
+        color=alt.Color(
+            "kind:N",
+            title="Node type",
+            scale=alt.Scale(
+                domain=["Feature", "Account"], range=["#f59e0b", "#3b82f6"]
+            ),
+            legend=alt.Legend(orient="bottom"),
+        ),
+        shape=alt.Shape(
+            "kind:N",
+            title="Node type",
+            scale=alt.Scale(domain=["Feature", "Account"], range=["diamond", "circle"]),
+            legend=None,
+        ),
+        tooltip=[
+            alt.Tooltip("kind:N", title="Node type"),
+            alt.Tooltip("name:N", title="Feature / account"),
+            alt.Tooltip("id:N", title="Original ID"),
+            alt.Tooltip("pagerank:Q", title="Combined PageRank", format=".6g"),
+            alt.Tooltip("details:N", title="Details"),
+        ],
+    )
+    _labels = (
+        _node_base.transform_filter(
+            "true"
+            if feature_network_account_labels.value
+            else alt.datum.kind == "Feature"
+        )
+        .mark_text(dy=-17, fontSize=10, color="#475569")
+        .encode(x=_x, y=_y, text="label:N")
+    )
+    feature_network_chart = (
+        alt.layer(_links, _arrows, _nodes, _labels)
+        .properties(
+            width="container",
+            height=620,
+            title=f"Top {_network['features']} features and their connected accounts",
+        )
+        .resolve_scale(color="independent")
+        .configure_view(stroke=None)
+        .interactive()
+    )
+    mo.vstack(
+        [
+            topic_widget_grid(
+                [
+                    mo.stat(f"{_network['features']:,}", label="Top features"),
+                    mo.stat(f"{_network['accounts']:,}", label="Connected accounts"),
+                    mo.stat(
+                        f"{_network['memberships']:,}",
+                        label="Displayed memberships",
+                        caption="Each represents two directed graph edges",
+                    ),
+                    mo.stat(
+                        f"{_network['social_edges']:,}",
+                        label="Displayed following edges",
+                    ),
+                ]
+            ),
+            mo.ui.altair_chart(
+                feature_network_chart, chart_selection=False, legend_selection=False
+            ),
+            mo.md(
+                "**Orange diamonds are features; blue circles are accounts.** Purple lines represent "
+                "bidirectional account–feature memberships. Gray arrows show following edges from follower "
+                "to followed account. All memberships between displayed features and accounts are included, "
+                "even if an account was selected for another feature. Node size uses the same combined "
+                "PageRank scale for both node types. Hover for full names, IDs, scores, and counts. "
+                "Scroll to zoom, drag to pan, and double-click to reset. Feature and account IDs occupy "
+                "separate namespaces. This is a selected view of the graph; hidden accounts and features "
+                "still contribute to the PageRank scores."
+            ),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def control_combined_account_ranking():
+    combined_account_top_count = mo.ui.slider(
+        start=10,
+        stop=50,
+        step=10,
+        value=20,
+        full_width=True,
+        label="Top accounts from the combined graph",
+    )
+    mo.vstack(
+        [
+            mo.md("### Account PageRank after including features"),
+            topic_widget_grid([combined_account_top_count]),
+            mo.md(
+                "These account scores come from the same full account-and-feature graph used above. "
+                "The following-edge walk share above controls both account and feature rankings. "
+                "Account share is the account's raw combined PageRank divided by the total mass on "
+                "account nodes. This normalization leaves account ordering unchanged and makes shares "
+                "comparable with the account-only model. A higher score is importance under this "
+                "random walk, not a causal effect of having features."
+            ),
+        ]
+    )
+    return (combined_account_top_count,)
+
+
+@app.cell(hide_code=True)
+def rank_accounts_in_combined_graph(
+    centrality_scores,
+    feature_account_incidence,
+    feature_pagerank_account_scores,
+    feature_pagerank_diagnostics,
+    network_node_ids,
+):
+    _account_mass = feature_pagerank_diagnostics["account_mass"]
+    mo.stop(
+        not feature_pagerank_diagnostics["converged"] or _account_mass <= 0,
+        mo.md(
+            "The combined PageRank model must converge with positive account mass before ranking accounts."
+        ),
+    )
+    _combined = pl.DataFrame(
+        {
+            "node": network_node_ids,
+            "combined_pagerank": feature_pagerank_account_scores,
+            "account_share": feature_pagerank_account_scores / _account_mass,
+            "recorded_features": np.asarray(
+                feature_account_incidence.sum(axis=1)
+            ).ravel(),
+        }
+    )
+    combined_account_ranking = (
+        centrality_scores.select(
+            "node",
+            "in_degree",
+            "out_degree",
+            pl.col("PageRank").alias("account_only_pagerank"),
+        )
+        .join(_combined, on="node", how="inner", validate="1:1")
+        .with_columns(
+            pl.col("combined_pagerank")
+            .rank(method="average", descending=True)
+            .alias("combined_rank"),
+            pl.col("account_only_pagerank")
+            .rank(method="average", descending=True)
+            .alias("account_only_rank"),
+        )
+        .with_columns(
+            (pl.col("account_only_rank") - pl.col("combined_rank")).alias("rank_gain")
+        )
+        .sort(["combined_pagerank", "node"], descending=[True, False])
+    )
+    _baseline_ranks = combined_account_ranking["account_only_rank"].to_numpy()
+    _combined_ranks = combined_account_ranking["combined_rank"].to_numpy()
+    combined_account_rank_correlation = (
+        float(np.corrcoef(_baseline_ranks, _combined_ranks)[0, 1])
+        if len(_baseline_ranks) > 1
+        and np.std(_baseline_ranks) > 0
+        and np.std(_combined_ranks) > 0
+        else None
+    )
+    return combined_account_rank_correlation, combined_account_ranking
+
+
+@app.cell(hide_code=True)
+def display_combined_account_ranking(
+    combined_account_rank_correlation,
+    combined_account_ranking,
+    combined_account_top_count,
+    feature_pagerank_diagnostics,
+):
+    _top = combined_account_ranking.head(combined_account_top_count.value).with_columns(
+        pl.col("node").cast(pl.String).alias("account")
+    )
+    _correlation = (
+        f"{combined_account_rank_correlation:.3f}"
+        if combined_account_rank_correlation is not None
+        else "Undefined"
+    )
+    _top_ids = _top["node"]
+    _baseline_top = combined_account_ranking.sort(
+        ["account_only_pagerank", "node"], descending=[True, False]
+    ).head(combined_account_top_count.value)
+    _overlap = len(set(_top_ids.to_list()) & set(_baseline_top["node"].to_list()))
+    combined_account_top_chart = (
+        alt.Chart(_top)
+        .mark_bar(color="#2563a6")
+        .encode(
+            x=alt.X(
+                "account_share:Q",
+                title="Share of account PageRank in combined graph",
+                axis=alt.Axis(format=".2%"),
+            ),
+            y=alt.Y("account:N", title="Account ID", sort=_top["account"].to_list()),
+            tooltip=[
+                alt.Tooltip("account:N", title="Account ID"),
+                alt.Tooltip(
+                    "account_share:Q", title="Combined account share", format=".4%"
+                ),
+                alt.Tooltip(
+                    "combined_pagerank:Q", title="Raw combined PageRank", format=".6g"
+                ),
+                alt.Tooltip("combined_rank:Q", title="Combined rank", format=",.1f"),
+                alt.Tooltip(
+                    "account_only_rank:Q", title="Account-only rank", format=",.1f"
+                ),
+                alt.Tooltip("rank_gain:Q", title="Rank gain", format="+,.1f"),
+                alt.Tooltip(
+                    "recorded_features:Q", title="Recorded features", format=",d"
+                ),
+                alt.Tooltip("in_degree:Q", title="Incoming connections", format=",d"),
+                alt.Tooltip("out_degree:Q", title="Outgoing connections", format=",d"),
+            ],
+        )
+        .properties(
+            title="Top accounts in account-and-feature graph",
+            width="container",
+            height=max(300, _top.height * 22),
+        )
+    )
+    _stride = max(1, int(np.ceil(combined_account_ranking.height / 2500)))
+    _sample = (
+        combined_account_ranking.sort("node")
+        .with_row_index("sample_index")
+        .filter(pl.col("sample_index") % _stride == 0)
+        .drop("sample_index")
+    )
+    _sample = (
+        pl.concat(
+            [
+                _sample,
+                _top.drop("account"),
+                _baseline_top,
+            ]
+        )
+        .unique("node")
+        .with_columns(
+            pl.col("node").cast(pl.String).alias("account"),
+            pl.when(pl.col("node").is_in(_top_ids.implode()))
+            .then(pl.lit("Top combined accounts"))
+            .otherwise(pl.lit("Other sampled accounts"))
+            .alias("group"),
+        )
+    )
+    _rank_domain = [1, combined_account_ranking.height]
+    _rank_x = alt.X(
+        "account_only_rank:Q",
+        title="Account-only PageRank rank (log scale)",
+        scale=alt.Scale(type="log", domain=_rank_domain),
+        axis=alt.Axis(format="~s", tickCount=5),
+    )
+    _rank_y = alt.Y(
+        "combined_rank:Q",
+        title="Combined PageRank rank (log scale)",
+        scale=alt.Scale(type="log", domain=_rank_domain, reverse=True),
+        axis=alt.Axis(format="~s", tickCount=5),
+    )
+    _equality = (
+        alt.Chart(
+            pl.DataFrame(
+                {"account_only_rank": _rank_domain, "combined_rank": _rank_domain}
+            )
+        )
+        .mark_line(
+            color="#64748b",
+            strokeDash=[5, 5],
+            opacity=0.7,
+        )
+        .encode(x=_rank_x, y=_rank_y)
+    )
+    _scatter = (
+        alt.Chart(_sample)
+        .mark_circle(size=35, opacity=0.6)
+        .encode(
+            x=_rank_x,
+            y=_rank_y,
+            color=alt.Color(
+                "group:N",
+                title="Account group",
+                scale=alt.Scale(
+                    domain=["Other sampled accounts", "Top combined accounts"],
+                    range=["#2563a6", "#f59e0b"],
+                ),
+                legend=alt.Legend(orient="bottom"),
+            ),
+            tooltip=[
+                alt.Tooltip("account:N", title="Account ID"),
+                alt.Tooltip("combined_rank:Q", title="Combined rank", format=",.1f"),
+                alt.Tooltip(
+                    "account_only_rank:Q", title="Account-only rank", format=",.1f"
+                ),
+                alt.Tooltip("rank_gain:Q", title="Rank gain", format="+,.1f"),
+                alt.Tooltip(
+                    "recorded_features:Q", title="Recorded features", format=",d"
+                ),
+            ],
+        )
+    )
+    combined_account_comparison_chart = (
+        (_equality + _scatter)
+        .properties(
+            width="container",
+            height=max(300, _top.height * 22),
+            title="Account rank changes after including features",
+        )
+        .interactive()
+    )
+    mo.vstack(
+        [
+            topic_widget_grid(
+                [
+                    mo.stat(
+                        f"{combined_account_ranking.height:,}", label="Accounts ranked"
+                    ),
+                    mo.stat(
+                        f"{feature_pagerank_diagnostics['account_mass']:.2%}",
+                        label="Combined PageRank mass on accounts",
+                    ),
+                    mo.stat(
+                        _correlation,
+                        label="Rank correlation with account-only model",
+                        caption="Spearman, all accounts; average ranks for ties",
+                    ),
+                    mo.stat(
+                        f"{_overlap} / {_top.height}",
+                        label="Top accounts shared with account-only model",
+                    ),
+                ]
+            ),
+            mo.hstack(
+                [
+                    mo.vstack(
+                        [
+                            mo.ui.altair_chart(
+                                combined_account_top_chart,
+                                chart_selection=False,
+                                legend_selection=False,
+                            )
+                        ]
+                    ),
+                    mo.vstack(
+                        [
+                            mo.ui.altair_chart(
+                                combined_account_comparison_chart,
+                                chart_selection=False,
+                                legend_selection=False,
+                            )
+                        ]
+                    ),
+                ],
+                widths="equal",
+                align="start",
+                gap=1.5,
+            ),
+            mo.md(
+                f"The rank comparison shows **{_sample.height:,} accounts**, using a deterministic sample plus the top accounts from both models. "
+                "Lower rank numbers are better. Points above the dashed equality line have improved ranks in the combined model. "
+                "The correlation and ranking table use all accounts. Positive rank gain means an improved rank. "
+                "Both models retain accounts without recorded features; adding features can change their scores too. "
+                "Ranking ties use average ranks, with account IDs ordering the displayed rows."
+            ),
+            mo.ui.table(
+                _top.drop("account"),
+                selection=None,
+                pagination=True,
+                page_size=10,
+                show_data_types=False,
+                show_column_summaries=False,
+                format_mapping={
+                    "combined_pagerank": "{:.6g}",
+                    "account_share": "{:.4%}",
+                    "account_only_pagerank": "{:.6g}",
+                    "rank_gain": "{:+,.1f}",
+                    "combined_rank": "{:,.1f}",
+                    "account_only_rank": "{:,.1f}",
+                },
+            ),
+            mo.accordion(
+                {
+                    "All account scores from the combined graph": mo.ui.table(
+                        combined_account_ranking,
+                        selection=None,
+                        pagination=True,
+                        page_size=10,
+                        show_data_types=False,
+                        show_column_summaries=False,
+                        format_mapping={
+                            "combined_pagerank": "{:.6g}",
+                            "account_share": "{:.4%}",
+                            "rank_gain": "{:+,.1f}",
+                        },
+                    )
+                }
+            ),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
 def describe_ego_network_selection():
     mo.md(r"""
     ## Select Node to Analyze
@@ -2383,11 +3725,11 @@ def build_egocentric_network(ego_node_dropdown, nodes_lf):
         )
     )
 
-    mo.ui.table(egocentric_network_lf)
+    mo.ui.table(egocentric_network_lf, selection=None)
     return (ego_node,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def define_ego_network_controls():
     ego_network_relationship = mo.ui.dropdown(
         options=[
@@ -2421,7 +3763,7 @@ def define_ego_network_controls():
     )
 
 
-@app.cell
+@app.cell(hide_code=True)
 def catalog_ego_network_features(ego_node, feats_lf, nodes_lf):
     _ego_lists = (
         nodes_lf.filter(pl.col("node") == ego_node)
