@@ -23,6 +23,513 @@ with app.setup:
 
 
 @app.cell(hide_code=True)
+def dashboard_header(feature_pagerank_graph_summary, network_structure_totals):
+    _totals = network_structure_totals
+    _reciprocity = _totals["edge_reciprocity"]
+    mo.vstack(
+        [
+            mo.md(
+                "# Twitter network explorer\nExplore relationships, influence, recorded features, and local neighborhoods in the observed dataset."
+            ),
+            topic_widget_grid(
+                [
+                    mo.stat(f"{_totals['nodes']:,}", label="Accounts"),
+                    mo.stat(
+                        f"{_totals['edges']:,}",
+                        label="Directed edges",
+                        caption="Excludes self-loops",
+                    ),
+                    mo.stat(
+                        f"{feature_pagerank_graph_summary['observed_features']:,}",
+                        label="Recorded features",
+                    ),
+                    mo.stat(
+                        f"{_reciprocity:.1%}"
+                        if _reciprocity is not None
+                        else "Undefined",
+                        label="Edge reciprocity",
+                        caption="Directed edges with a reverse edge",
+                    ),
+                ]
+            ),
+        ],
+        gap=0.75,
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def dashboard_shared_settings(
+    feature_pagerank_min_accounts,
+    feature_pagerank_social_share,
+):
+    mo.accordion(
+        {
+            "Shared feature model settings · affects Feature model and Clustering": mo.vstack(
+                [
+                    topic_widget_grid(
+                        [feature_pagerank_social_share, feature_pagerank_min_accounts]
+                    ),
+                    mo.md(
+                        "The following-edge walk share recomputes combined PageRank. The minimum-account filter changes feature views and clustering candidates; it does not change PageRank scores. Ranking display limits are local to their views."
+                    ),
+                ]
+            )
+        }
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def dashboard_navigation():
+    # Keep navigation independent of result cells so filtering preserves the active tab.
+    dashboard_tabs = mo.ui.tabs(
+        {
+            _label: ""
+            for _label in [
+                "Degree",
+                "Centrality",
+                "Connectivity",
+                "Feature model",
+                "Clustering",
+                "Ego explorer",
+                "Data & methods",
+            ]
+        },
+        value="Degree",
+        label="Analysis",
+    )
+    degree_view_tabs = mo.ui.tabs(
+        {
+            _label: ""
+            for _label in ["Histogram", "ECDF", "Log-log tail", "Inequality", "Summary"]
+        },
+        label="Degree view",
+    )
+    centrality_view_tabs = mo.ui.tabs(
+        {_label: "" for _label in ["Rankings", "PageRank network", "Rank agreement"]},
+        label="Centrality view",
+    )
+    connectivity_view_tabs = mo.ui.tabs(
+        {
+            _label: ""
+            for _label in ["Components", "Global reciprocity", "Node reciprocity"]
+        },
+        label="Connectivity view",
+    )
+    feature_view_tabs = mo.ui.tabs(
+        {_label: "" for _label in ["Feature rankings", "Account rankings", "Network"]},
+        label="Feature model view",
+    )
+    clustering_view_tabs = mo.ui.tabs(
+        {_label: "" for _label in ["Accounts", "Features"]},
+        label="Clustering population",
+    )
+    ego_view_tabs = mo.ui.tabs(
+        {_label: "" for _label in ["Network", "Neighborhood table"]},
+        label="Ego view",
+    )
+    data_view_tabs = mo.ui.tabs(
+        {
+            _label: ""
+            for _label in ["Nodes", "Feature catalog", "Cache status", "Preparation"]
+        },
+        label="Data view",
+    )
+    dashboard_tabs
+    return (
+        centrality_view_tabs,
+        clustering_view_tabs,
+        connectivity_view_tabs,
+        dashboard_tabs,
+        data_view_tabs,
+        degree_view_tabs,
+        ego_view_tabs,
+        feature_view_tabs,
+    )
+
+
+@app.cell(hide_code=True)
+def dashboard_degree(
+    dashboard_tabs,
+    degree_distribution_views,
+    degree_inequality_view,
+    degree_method_notes,
+    degree_metric_selector,
+    degree_summary_view,
+    degree_view_tabs,
+    selected_degree_summary,
+):
+    mo.stop(dashboard_tabs.value != "Degree")
+    _views = {
+        **degree_distribution_views,
+        "Inequality": degree_inequality_view,
+        "Summary": degree_summary_view,
+    }
+    mo.vstack(
+        [
+            mo.md("### Degree and connection inequality"),
+            topic_widget_grid([degree_metric_selector]),
+            degree_view_tabs,
+            mo.md(
+                f"**{selected_degree_summary['zero_nodes']:,} zero-degree nodes ({selected_degree_summary['zero_share']:.3%})** · All probability denominators include zero-degree nodes."
+            ),
+            _views[degree_view_tabs.value],
+            mo.accordion({"Methods and scope": degree_method_notes}),
+        ],
+        gap=0.75,
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def dashboard_centrality(
+    centrality_agreement_view,
+    centrality_method_notes,
+    centrality_method_selector,
+    centrality_ranking_view,
+    centrality_top_count,
+    centrality_view_tabs,
+    dashboard_tabs,
+    pagerank_network_labels,
+    pagerank_network_neighbors,
+    pagerank_network_view,
+):
+    mo.stop(dashboard_tabs.value != "Centrality")
+    if centrality_view_tabs.value == "Rankings":
+        _view = mo.vstack(
+            [
+                topic_widget_grid([centrality_method_selector, centrality_top_count]),
+                centrality_ranking_view,
+            ]
+        )
+    elif centrality_view_tabs.value == "PageRank network":
+        _view = mo.vstack(
+            [
+                mo.md(
+                    "This network always uses **PageRank**. The ranking measure in the Rankings view does not change this graph."
+                ),
+                topic_widget_grid(
+                    [
+                        centrality_top_count,
+                        pagerank_network_neighbors,
+                        pagerank_network_labels,
+                    ]
+                ),
+                pagerank_network_view,
+            ]
+        )
+    else:
+        _view = centrality_agreement_view
+    mo.vstack(
+        [
+            mo.md("### Centrality and influence"),
+            centrality_view_tabs,
+            _view,
+            mo.accordion({"Methods and scope": centrality_method_notes}),
+        ],
+        gap=0.75,
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def dashboard_connectivity(
+    component_distribution_view,
+    component_overview_view,
+    component_type_selector,
+    connectivity_method_notes,
+    connectivity_view_tabs,
+    dashboard_tabs,
+    global_reciprocity_view,
+    node_reciprocity_view,
+):
+    mo.stop(dashboard_tabs.value != "Connectivity")
+    if connectivity_view_tabs.value == "Components":
+        _view = mo.vstack(
+            [
+                topic_widget_grid([component_type_selector]),
+                component_distribution_view,
+                mo.accordion(
+                    {"Component overview and exact counts": component_overview_view}
+                ),
+            ]
+        )
+    elif connectivity_view_tabs.value == "Global reciprocity":
+        _view = global_reciprocity_view
+    else:
+        _view = node_reciprocity_view
+    mo.vstack(
+        [
+            mo.md("### Connectivity and reciprocity"),
+            connectivity_view_tabs,
+            _view,
+            mo.accordion({"Methods and scope": connectivity_method_notes}),
+        ],
+        gap=0.75,
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def dashboard_feature_model(
+    combined_account_ranking_view,
+    combined_account_top_count,
+    dashboard_tabs,
+    feature_model_notes,
+    feature_network_account_labels,
+    feature_network_account_ranking,
+    feature_network_accounts_per_feature,
+    feature_network_social_edges,
+    feature_network_view,
+    feature_pagerank_min_accounts,
+    feature_pagerank_social_share,
+    feature_pagerank_top_count,
+    feature_ranking_view,
+    feature_view_tabs,
+):
+    mo.stop(dashboard_tabs.value != "Feature model")
+    if feature_view_tabs.value == "Feature rankings":
+        _view = mo.vstack(
+            [topic_widget_grid([feature_pagerank_top_count]), feature_ranking_view]
+        )
+    elif feature_view_tabs.value == "Account rankings":
+        _view = mo.vstack(
+            [
+                topic_widget_grid([combined_account_top_count]),
+                combined_account_ranking_view,
+            ]
+        )
+    else:
+        _view = mo.vstack(
+            [
+                topic_widget_grid(
+                    [
+                        feature_pagerank_top_count,
+                        feature_network_accounts_per_feature,
+                        feature_network_account_ranking,
+                    ]
+                ),
+                mo.hstack(
+                    [feature_network_social_edges, feature_network_account_labels],
+                    justify="start",
+                ),
+                feature_network_view,
+            ]
+        )
+    mo.vstack(
+        [
+            mo.md("### Account and feature PageRank"),
+            mo.md(
+                f"**Active model:** {feature_pagerank_social_share.value:.0%} following-edge walk share · minimum **{feature_pagerank_min_accounts.value} accounts** per feature. Change these in Shared feature model settings above."
+            ),
+            feature_view_tabs,
+            _view,
+            mo.accordion({"Methods and scope": feature_model_notes}),
+        ],
+        gap=0.75,
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def dashboard_clustering(
+    cluster_diagnostics_view,
+    clustering_method_notes,
+    clustering_view_tabs,
+    dashboard_tabs,
+    feature_pagerank_min_accounts,
+    feature_pagerank_social_share,
+    ranked_cluster_account_eps,
+    ranked_cluster_account_ranking,
+    ranked_cluster_feature_eps,
+    ranked_cluster_k,
+    ranked_cluster_min_samples,
+    ranked_cluster_population_views,
+    ranked_cluster_top_count,
+):
+    mo.stop(dashboard_tabs.value != "Clustering")
+    _population = clustering_view_tabs.value
+    _population_controls = (
+        [ranked_cluster_account_ranking, ranked_cluster_account_eps]
+        if _population == "Accounts"
+        else [ranked_cluster_feature_eps]
+    )
+    mo.vstack(
+        [
+            mo.md("### Cluster ranked profiles"),
+            mo.md(
+                f"**Active feature model:** {feature_pagerank_social_share.value:.0%} following-edge walk share · minimum **{feature_pagerank_min_accounts.value} accounts** per feature. These shared settings affect candidates; ranking display limits do not."
+            ),
+            topic_widget_grid(
+                [ranked_cluster_top_count, ranked_cluster_k, ranked_cluster_min_samples]
+            ),
+            clustering_view_tabs,
+            topic_widget_grid(_population_controls),
+            ranked_cluster_population_views[_population],
+            mo.accordion(
+                {
+                    "Coverage and separation diagnostics": cluster_diagnostics_view,
+                    "Methods and scope": clustering_method_notes,
+                }
+            ),
+        ],
+        gap=0.75,
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def dashboard_ego_explorer(
+    dashboard_tabs,
+    ego_network_feature,
+    ego_network_labels,
+    ego_network_neighbor_edges,
+    ego_network_node_limit,
+    ego_network_notes,
+    ego_network_relationship,
+    ego_network_view,
+    ego_node_dropdown,
+    ego_view_tabs,
+    egocentric_network_lf,
+):
+    mo.stop(dashboard_tabs.value != "Ego explorer")
+    if ego_view_tabs.value == "Network":
+        _view = mo.vstack(
+            [
+                topic_widget_grid(
+                    [
+                        ego_network_relationship,
+                        ego_network_feature,
+                        ego_network_node_limit,
+                    ]
+                ),
+                mo.hstack(
+                    [ego_network_neighbor_edges, ego_network_labels], justify="start"
+                ),
+                ego_network_view,
+            ]
+        )
+    else:
+        _view = mo.vstack(
+            [
+                mo.md(
+                    "**Table scope:** selected ego plus all accounts it follows. Plot relationship, feature, and node-limit filters apply only to the Network view. The `alter_*` columns count relationships within this table's membership."
+                ),
+                mo.ui.table(
+                    egocentric_network_lf,
+                    selection=None,
+                    pagination=True,
+                    page_size=10,
+                    show_data_types=False,
+                    show_column_summaries=False,
+                ),
+            ]
+        )
+    mo.vstack(
+        [
+            mo.md("### Explore an ego network"),
+            topic_widget_grid([ego_node_dropdown]),
+            ego_view_tabs,
+            _view,
+            mo.accordion({"Methods and scope": ego_network_notes}),
+        ],
+        gap=0.75,
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def dashboard_data_methods(
+    PARQUET_OUT_PATH,
+    dashboard_tabs,
+    data_loading_notes,
+    data_view_tabs,
+    directed_edge_notes,
+    ego_feature_notes,
+    feats_lf,
+    feature_catalog_notes,
+    node_relationship_notes,
+    nodes_lf,
+    parquet_cache_notes,
+    parquet_cache_report,
+):
+    mo.stop(dashboard_tabs.value != "Data & methods")
+    if data_view_tabs.value == "Nodes":
+        _view = mo.vstack(
+            [
+                node_relationship_notes,
+                mo.ui.table(
+                    nodes_lf,
+                    selection=None,
+                    pagination=True,
+                    page_size=10,
+                    show_data_types=False,
+                    show_column_summaries=False,
+                ),
+            ]
+        )
+    elif data_view_tabs.value == "Feature catalog":
+        _view = mo.vstack(
+            [
+                feature_catalog_notes,
+                mo.ui.table(
+                    feats_lf,
+                    selection=None,
+                    pagination=True,
+                    page_size=10,
+                    show_data_types=False,
+                    show_column_summaries=False,
+                ),
+            ]
+        )
+    elif data_view_tabs.value == "Cache status":
+        _cache_files = ["edges.parquet", "feature_names.parquet", "nodes.parquet"]
+        _cache_status = pl.DataFrame(
+            [
+                {
+                    "file": _file,
+                    "exists": (PARQUET_OUT_PATH / _file).is_file(),
+                    "size_mib": round(
+                        (PARQUET_OUT_PATH / _file).stat().st_size / 1024**2, 2
+                    )
+                    if (PARQUET_OUT_PATH / _file).is_file()
+                    else None,
+                }
+                for _file in _cache_files
+            ]
+        )
+        _view = mo.vstack(
+            [
+                mo.md("#### Current cache files"),
+                mo.ui.table(_cache_status, selection=None, pagination=False),
+                mo.accordion(
+                    {
+                        "Loader cache report": mo.ui.table(
+                            parquet_cache_report, selection=None, pagination=False
+                        ),
+                        "Cache rules and refresh behavior": parquet_cache_notes,
+                    }
+                ),
+            ]
+        )
+    else:
+        _view = mo.accordion(
+            {
+                "Loading and directed edges": mo.vstack(
+                    [data_loading_notes, directed_edge_notes]
+                ),
+                "Source features and normalization": ego_feature_notes,
+                "Feature consolidation": feature_catalog_notes,
+                "Node relationships": node_relationship_notes,
+                "Caching and source changes": parquet_cache_notes,
+            }
+        )
+    mo.vstack([mo.md("### Data and preparation"), data_view_tabs, _view], gap=0.75)
+    return
+
+
+@app.cell(hide_code=True)
 def resolve_data_paths():
     # Resolve every data location relative to this notebook so it can be run
     # from any working directory.
@@ -36,7 +543,7 @@ def resolve_data_paths():
 
 @app.cell(hide_code=True)
 def describe_data_loading():
-    mo.md(r"""
+    data_loading_notes = mo.md(r"""
     ## Load Data
 
     The source dataset is loaded into Polars `LazyFrame` objects so transformations
@@ -44,19 +551,19 @@ def describe_data_loading():
     Whenever a Parquet cache already exists, the notebook scans it instead of
     reparsing the original text files.
     """)
-    return
+    return (data_loading_notes,)
 
 
 @app.cell(hide_code=True)
 def describe_directed_edges():
-    mo.md(r"""
+    directed_edge_notes = mo.md(r"""
     ### Edges
 
     Each row is a directed Twitter relationship from `from` to `to`. The loader
     prefers `data/out/edges.parquet`; otherwise it reads `twitter_combined.txt`,
     removes duplicate edges, and sorts the result for deterministic output.
     """)
-    return
+    return (directed_edge_notes,)
 
 
 @app.cell(hide_code=True)
@@ -82,7 +589,7 @@ def load_directed_edges(PARQUET_OUT_PATH, TWITTER_COMBINED_TXT_PATH):
 
 @app.cell(hide_code=True)
 def describe_ego_features():
-    mo.md(r"""
+    ego_feature_notes = mo.md(r"""
     ### Features
 
     Twitter ego-network features are split across several file types:
@@ -101,7 +608,7 @@ def describe_ego_features():
     pairs are retained as provenance so all original positions decode to that code.
     Membership is the union of matching positions and observations.
     """)
-    return
+    return (ego_feature_notes,)
 
 
 @app.cell(hide_code=True)
@@ -283,7 +790,7 @@ def load_node_feature_vectors(
 
 @app.cell(hide_code=True)
 def describe_parquet_caching():
-    mo.md("""
+    parquet_cache_notes = mo.md("""
     ## Save Data to Parquet
 
     This section converts the normalized lazy datasets into reusable Parquet
@@ -314,7 +821,7 @@ def describe_parquet_caching():
     > automatically. After changing binary vector or edge files, delete the affected
     > node or edge cache in `data/out` and rerun the loading section.
     """)
-    return
+    return (parquet_cache_notes,)
 
 
 @app.function(hide_code=True)
@@ -398,13 +905,12 @@ def cache_edges_and_feature_catalog(
         metadata=feature_cache_metadata,
     )
     parquet_cache_report = pl.DataFrame([_edges_cache_report, _feats_cache_report])
-    mo.ui.table(parquet_cache_report, selection=None)
-    return edges_lf, feats_lf, feature_cache_metadata
+    return edges_lf, feats_lf, feature_cache_metadata, parquet_cache_report
 
 
 @app.cell(hide_code=True)
 def describe_consolidated_features():
-    mo.md(r"""
+    feature_catalog_notes = mo.md(r"""
     ### Consolidated Feature View
 
     `feats_lf` is the unique global catalog of lowercase, alphanumeric names. Its `sources` list records
@@ -418,7 +924,7 @@ def describe_consolidated_features():
     These compact lists are saved directly in `nodes.parquet` below. The displayed
     table shows the global feature catalog with its provenance.
     """)
-    return
+    return (feature_catalog_notes,)
 
 
 @app.cell(hide_code=True)
@@ -485,13 +991,12 @@ def consolidate_node_features(
             )
             .sort("node")
         )
-    mo.ui.table(feats_lf, selection=None)
     return (node_feature_lists_lf,)
 
 
 @app.cell(hide_code=True)
 def describe_node_relationships():
-    mo.md(r"""
+    node_relationship_notes = mo.md(r"""
     ## Gather Node Data
 
     The directed edge list is aggregated into one row per Twitter node. For each
@@ -507,7 +1012,7 @@ def describe_node_relationships():
     replaced with empty lists and zeros. Nodes found only in feature files are
     included too. The resulting table is cached in `data/out/nodes.parquet`.
     """)
-    return
+    return (node_relationship_notes,)
 
 
 @app.cell(hide_code=True)
@@ -586,13 +1091,12 @@ def consolidate_and_cache_nodes(
         )
     # The consolidated node cache now contains all persisted feature lists.
     (PARQUET_OUT_PATH / "node_feature_vectors.parquet").unlink(missing_ok=True)
-    mo.ui.table(nodes_lf, selection=None)
     return (nodes_lf,)
 
 
 @app.cell(hide_code=True)
 def degree_analysis_intro():
-    mo.md(r"""
+    degree_method_notes = mo.md(r"""
     ## 1. Degree distributions and connection inequality
 
     Compare **followers (in-degree)**, **following (out-degree)**, and
@@ -604,7 +1108,7 @@ def degree_analysis_intro():
     inequality views describe how connections are distributed among nodes.
     Mutual counts measure node incidences, rather than distinct mutual pairs.
     """)
-    return
+    return (degree_method_notes,)
 
 
 @app.function(hide_code=True)
@@ -736,7 +1240,7 @@ def degree_analysis_data(nodes_lf):
 
 @app.cell(hide_code=True)
 def degree_analysis_summary(degree_counts, degree_summary):
-    mo.vstack(
+    degree_summary_view = mo.vstack(
         [
             mo.md(f"### Summary across {degree_counts.height:,} nodes"),
             mo.ui.table(
@@ -769,14 +1273,14 @@ def degree_analysis_summary(degree_counts, degree_summary):
             ),
         ]
     )
-    return
+    return (degree_summary_view,)
 
 
 @app.function(hide_code=True)
 def topic_widget_grid(items):
     """Arrange related widgets in equal responsive columns with readable spacing."""
     cards = "".join(
-        '<div style="min-width:0;padding:1rem;border:1px solid '
+        '<div style="min-width:0;padding:0.65rem;border:1px solid '
         'var(--gray-5, #e2e8f0);border-radius:0.65rem;">'
         + mo.as_html(item).text
         + "</div>"
@@ -784,8 +1288,8 @@ def topic_widget_grid(items):
     )
     return mo.Html(
         '<div class="topic-widget-grid" style="display:grid;'
-        "grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr));"
-        'gap:1rem;align-items:stretch;width:100%;">' + cards + "</div>"
+        "grid-template-columns:repeat(auto-fit,minmax(min(100%,12rem),1fr));"
+        'gap:0.65rem;align-items:stretch;width:100%;">' + cards + "</div>"
     )
 
 
@@ -796,12 +1300,6 @@ def degree_analysis_selector(degree_metrics):
         value="Followers (in-degree)",
         label="Relationship to explore",
         full_width=True,
-    )
-    mo.vstack(
-        [
-            mo.md("### Degree controls"),
-            topic_widget_grid([degree_metric_selector]),
-        ]
     )
     return (degree_metric_selector,)
 
@@ -822,7 +1320,6 @@ def degree_analysis_selection(degree_metric_selector, degree_profiles):
 def degree_analysis_distributions(
     selected_degree_metric,
     selected_degree_profile,
-    selected_degree_summary,
 ):
     _frequency = selected_degree_profile["frequency"]
     _ecdf_data = _frequency.select("degree", "ecdf")
@@ -910,59 +1407,47 @@ def degree_analysis_distributions(
             height=300,
         )
     )
-    mo.vstack(
-        [
-            mo.md(f"### Distributions: {selected_degree_metric}"),
-            mo.md(
-                f"**Zero-degree nodes: {selected_degree_summary['zero_nodes']:,} ({selected_degree_summary['zero_share']:.3%}).** All statistics and probability denominators include these nodes."
-            ),
-            mo.ui.tabs(
-                {
-                    "Histogram": mo.vstack(
-                        [
-                            mo.md(
-                                "Equal-width, integer-aligned bins cover the full observed range. Switch to the ECDF for exact cumulative shares."
-                            ),
-                            mo.ui.altair_chart(
-                                degree_histogram_chart,
-                                chart_selection=False,
-                                legend_selection=False,
-                            ),
-                        ]
-                    ),
-                    "ECDF": mo.vstack(
-                        [
-                            mo.md(
-                                "At k, the curve gives the fraction of all nodes with at most k connections."
-                            ),
-                            mo.ui.altair_chart(
-                                degree_ecdf_chart,
-                                chart_selection=False,
-                                legend_selection=False,
-                            ),
-                        ]
-                    ),
-                    "Log-log tail": mo.vstack(
-                        [
-                            mo.md(
-                                "Only positive degrees can appear on a log axis; shares still use all nodes as the denominator. The curve is P(D ≥ k), including equality. A straight-looking tail does not establish a power law."
-                            ),
-                            mo.ui.altair_chart(
-                                degree_ccdf_chart,
-                                chart_selection=False,
-                                legend_selection=False,
-                            )
-                            if not _tail.is_empty()
-                            else mo.md(
-                                "No positive degrees are available for a log-log plot."
-                            ),
-                        ]
-                    ),
-                }
-            ),
-        ]
-    )
-    return
+    degree_distribution_views = {
+        "Histogram": mo.vstack(
+            [
+                mo.md(
+                    "Equal-width, integer-aligned bins cover the full observed range. Switch to the ECDF for exact cumulative shares."
+                ),
+                mo.ui.altair_chart(
+                    degree_histogram_chart,
+                    chart_selection=False,
+                    legend_selection=False,
+                ),
+            ]
+        ),
+        "ECDF": mo.vstack(
+            [
+                mo.md(
+                    "At k, the curve gives the fraction of all nodes with at most k connections."
+                ),
+                mo.ui.altair_chart(
+                    degree_ecdf_chart,
+                    chart_selection=False,
+                    legend_selection=False,
+                ),
+            ]
+        ),
+        "Log-log tail": mo.vstack(
+            [
+                mo.md(
+                    "Only positive degrees can appear on a log axis; shares still use all nodes as the denominator. The curve is P(D ≥ k), including equality. A straight-looking tail does not establish a power law."
+                ),
+                mo.ui.altair_chart(
+                    degree_ccdf_chart,
+                    chart_selection=False,
+                    legend_selection=False,
+                )
+                if not _tail.is_empty()
+                else mo.md("No positive degrees are available for a log-log plot."),
+            ]
+        ),
+    }
+    return (degree_distribution_views,)
 
 
 @app.cell(hide_code=True)
@@ -973,173 +1458,183 @@ def degree_analysis_inequality(
     selected_degree_profile,
     selected_degree_summary,
 ):
-    mo.stop(
-        selected_degree_summary["total"] == 0,
-        mo.md(
-            "Connection shares, the Lorenz curve, and Gini are undefined when every node has zero connections."
-        ),
-    )
-    _shares = selected_degree_profile["top_shares"]
-    _top_one = _shares.filter(pl.col("top_fraction") == 0.01).row(0, named=True)
-    _top_ten = _shares.filter(pl.col("top_fraction") == 0.10).row(0, named=True)
-    _equality = (
-        alt.Chart(pl.DataFrame({"x": [0.0, 1.0], "y": [0.0, 1.0]}))
-        .mark_line(color="#666666", strokeDash=[5, 5])
-        .encode(
-            x=alt.X("x:Q", title="Cumulative share of nodes (least to most connected)"),
-            y=alt.Y("y:Q", title="Cumulative share of connections"),
-        )
-    )
-    _lorenz = (
-        alt.Chart(selected_degree_profile["lorenz"])
-        .mark_line(color="#2563a6", strokeWidth=2)
-        .encode(
-            x=alt.X(
-                "population_share:Q",
-                title="Cumulative share of nodes (least to most connected)",
-                scale=alt.Scale(domain=[0, 1]),
-                axis=alt.Axis(format=".0%", tickCount=5),
-            ),
-            y=alt.Y(
-                "connection_share:Q",
-                title="Cumulative share of connections",
-                scale=alt.Scale(domain=[0, 1]),
-                axis=alt.Axis(format=".0%", tickCount=5),
-            ),
-            tooltip=[
-                alt.Tooltip("population_share:Q", title="Node share", format=".2%"),
-                alt.Tooltip(
-                    "connection_share:Q", title="Connection share", format=".2%"
+    def _build_panel():
+        if selected_degree_summary["total"] == 0:
+            return mo.md(
+                "Connection shares, the Lorenz curve, and Gini are undefined when every node has zero connections."
+            )
+        _shares = selected_degree_profile["top_shares"]
+        _top_one = _shares.filter(pl.col("top_fraction") == 0.01).row(0, named=True)
+        _top_ten = _shares.filter(pl.col("top_fraction") == 0.10).row(0, named=True)
+        _equality = (
+            alt.Chart(pl.DataFrame({"x": [0.0, 1.0], "y": [0.0, 1.0]}))
+            .mark_line(color="#666666", strokeDash=[5, 5])
+            .encode(
+                x=alt.X(
+                    "x:Q", title="Cumulative share of nodes (least to most connected)"
                 ),
-            ],
+                y=alt.Y("y:Q", title="Cumulative share of connections"),
+            )
         )
-    )
-    degree_lorenz_chart = (_lorenz + _equality).properties(
-        title=f"Lorenz curve — {selected_degree_metric}", width="container", height=340
-    )
-    _share_bars = (
-        alt.Chart(_shares)
-        .mark_bar(color="#2563a6")
-        .encode(
-            x=alt.X(
-                "connection_share:Q",
-                title="Share of all connections",
-                scale=alt.Scale(domain=[0, 1]),
-                axis=alt.Axis(format=".0%", tickCount=5),
-            ),
-            y=alt.Y("top_group:N", title=None, sort=_shares["top_group"].to_list()),
-            tooltip=[
-                alt.Tooltip("top_group:N", title="Ranked group"),
-                alt.Tooltip("nodes:Q", title="Nodes in group", format=",d"),
-                alt.Tooltip(
-                    "actual_node_share:Q", title="Actual node share", format=".3%"
+        _lorenz = (
+            alt.Chart(selected_degree_profile["lorenz"])
+            .mark_line(color="#2563a6", strokeWidth=2)
+            .encode(
+                x=alt.X(
+                    "population_share:Q",
+                    title="Cumulative share of nodes (least to most connected)",
+                    scale=alt.Scale(domain=[0, 1]),
+                    axis=alt.Axis(format=".0%", tickCount=5),
                 ),
-                alt.Tooltip("connections:Q", title="Connections", format=",d"),
-                alt.Tooltip(
-                    "connection_share:Q", title="Connection share", format=".2%"
+                y=alt.Y(
+                    "connection_share:Q",
+                    title="Cumulative share of connections",
+                    scale=alt.Scale(domain=[0, 1]),
+                    axis=alt.Axis(format=".0%", tickCount=5),
                 ),
-            ],
-        )
-    )
-    degree_top_share_chart = (
-        _share_bars
-        + _share_bars.mark_text(align="left", dx=5, color="#333333").encode(
-            text=alt.Text("connection_share:Q", format=".1%")
-        )
-    ).properties(
-        title=f"Connection share held by top-ranked nodes — {selected_degree_metric}",
-        width="container",
-        height=340,
-    )
-    mo.vstack(
-        [
-            mo.md(f"### Connection inequality: {selected_degree_metric}"),
-            topic_widget_grid(
-                [
-                    mo.stat(
-                        f"{selected_degree_summary['gini']:.3f}",
-                        label="Gini coefficient",
-                        caption="0 = equal counts; closer to 1 = more unequal",
-                    ),
-                    mo.stat(
-                        f"{_top_one['connection_share']:.1%}",
-                        label="Connection share held by top 1%",
-                        caption=f"{_top_one['nodes']:,} nodes",
-                    ),
-                    mo.stat(
-                        f"{_top_ten['connection_share']:.1%}",
-                        label="Connection share held by top 10%",
-                        caption=f"{_top_ten['nodes']:,} nodes",
-                    ),
-                ]
-            ),
-            mo.hstack(
-                [
-                    mo.vstack(
-                        [
-                            mo.ui.altair_chart(
-                                degree_lorenz_chart,
-                                chart_selection=False,
-                                legend_selection=False,
-                            ),
-                            mo.md(
-                                "The dashed diagonal represents equal counts for every node. The blue Lorenz curve ranks nodes from least to most connected. Gini is twice the area between these curves, without finite-sample correction."
-                            ),
-                        ]
-                    ),
-                    mo.vstack(
-                        [
-                            mo.ui.altair_chart(
-                                degree_top_share_chart,
-                                chart_selection=False,
-                                legend_selection=False,
-                            ),
-                            mo.md(
-                                "Top groups are nested, not additive. Each contains ceil(fraction × node count) nodes ranked independently by the selected relationship; ties at the boundary have equal counts. Hover for actual group sizes."
-                            ),
-                        ]
+                tooltip=[
+                    alt.Tooltip("population_share:Q", title="Node share", format=".2%"),
+                    alt.Tooltip(
+                        "connection_share:Q", title="Connection share", format=".2%"
                     ),
                 ],
-                widths="equal",
-                align="start",
-                gap=1.5,
-            ),
-            mo.accordion(
-                {
-                    "Exact concentration statistics for all relationships": mo.ui.table(
-                        degree_summary.select("metric", "nodes", "total", "gini")
-                        .join(degree_top_shares, on="metric", how="left", suffix="_top")
-                        .select(
-                            "metric",
-                            "gini",
-                            "top_group",
-                            pl.col("nodes_top").alias("top_nodes"),
-                            "actual_node_share",
-                            "connections",
-                            "connection_share",
+            )
+        )
+        degree_lorenz_chart = (_lorenz + _equality).properties(
+            title=f"Lorenz curve — {selected_degree_metric}",
+            width="container",
+            height=340,
+        )
+        _share_bars = (
+            alt.Chart(_shares)
+            .mark_bar(color="#2563a6")
+            .encode(
+                x=alt.X(
+                    "connection_share:Q",
+                    title="Share of all connections",
+                    scale=alt.Scale(domain=[0, 1]),
+                    axis=alt.Axis(format=".0%", tickCount=5),
+                ),
+                y=alt.Y("top_group:N", title=None, sort=_shares["top_group"].to_list()),
+                tooltip=[
+                    alt.Tooltip("top_group:N", title="Ranked group"),
+                    alt.Tooltip("nodes:Q", title="Nodes in group", format=",d"),
+                    alt.Tooltip(
+                        "actual_node_share:Q", title="Actual node share", format=".3%"
+                    ),
+                    alt.Tooltip("connections:Q", title="Connections", format=",d"),
+                    alt.Tooltip(
+                        "connection_share:Q", title="Connection share", format=".2%"
+                    ),
+                ],
+            )
+        )
+        degree_top_share_chart = (
+            _share_bars
+            + _share_bars.mark_text(align="left", dx=5, color="#333333").encode(
+                text=alt.Text("connection_share:Q", format=".1%")
+            )
+        ).properties(
+            title=f"Connection share held by top-ranked nodes — {selected_degree_metric}",
+            width="container",
+            height=340,
+        )
+        return mo.vstack(
+            [
+                mo.md(f"### Connection inequality: {selected_degree_metric}"),
+                topic_widget_grid(
+                    [
+                        mo.stat(
+                            f"{selected_degree_summary['gini']:.3f}",
+                            label="Gini coefficient",
+                            caption="0 = equal counts; closer to 1 = more unequal",
                         ),
-                        selection=None,
-                        pagination=False,
-                        show_data_types=False,
-                        show_column_summaries=False,
-                        format_mapping={
-                            "gini": "{:.4f}",
-                            "actual_node_share": "{:.3%}",
-                            "connection_share": "{:.2%}",
-                            "connections": "{:,}",
-                            "top_nodes": "{:,}",
-                        },
-                    )
-                }
-            ),
-        ]
-    )
-    return
+                        mo.stat(
+                            f"{_top_one['connection_share']:.1%}",
+                            label="Connection share held by top 1%",
+                            caption=f"{_top_one['nodes']:,} nodes",
+                        ),
+                        mo.stat(
+                            f"{_top_ten['connection_share']:.1%}",
+                            label="Connection share held by top 10%",
+                            caption=f"{_top_ten['nodes']:,} nodes",
+                        ),
+                    ]
+                ),
+                mo.hstack(
+                    [
+                        mo.vstack(
+                            [
+                                mo.ui.altair_chart(
+                                    degree_lorenz_chart,
+                                    chart_selection=False,
+                                    legend_selection=False,
+                                ),
+                                mo.md(
+                                    "The dashed diagonal represents equal counts for every node. The blue Lorenz curve ranks nodes from least to most connected. Gini is twice the area between these curves, without finite-sample correction."
+                                ),
+                            ]
+                        ),
+                        mo.vstack(
+                            [
+                                mo.ui.altair_chart(
+                                    degree_top_share_chart,
+                                    chart_selection=False,
+                                    legend_selection=False,
+                                ),
+                                mo.md(
+                                    "Top groups are nested, not additive. Each contains ceil(fraction × node count) nodes ranked independently by the selected relationship; ties at the boundary have equal counts. Hover for actual group sizes."
+                                ),
+                            ]
+                        ),
+                    ],
+                    widths="equal",
+                    align="start",
+                    gap=1.5,
+                ),
+                mo.accordion(
+                    {
+                        "Exact concentration statistics for all relationships": mo.ui.table(
+                            degree_summary.select("metric", "nodes", "total", "gini")
+                            .join(
+                                degree_top_shares,
+                                on="metric",
+                                how="left",
+                                suffix="_top",
+                            )
+                            .select(
+                                "metric",
+                                "gini",
+                                "top_group",
+                                pl.col("nodes_top").alias("top_nodes"),
+                                "actual_node_share",
+                                "connections",
+                                "connection_share",
+                            ),
+                            selection=None,
+                            pagination=False,
+                            show_data_types=False,
+                            show_column_summaries=False,
+                            format_mapping={
+                                "gini": "{:.4f}",
+                                "actual_node_share": "{:.3%}",
+                                "connection_share": "{:.2%}",
+                                "connections": "{:,}",
+                                "top_nodes": "{:,}",
+                            },
+                        )
+                    }
+                ),
+            ]
+        )
+
+    degree_inequality_view = _build_panel()
+    return (degree_inequality_view,)
 
 
 @app.cell(hide_code=True)
 def describe_node_centrality():
-    mo.md(r"""
+    centrality_method_notes = mo.md(r"""
     ## 2. Node centrality
 
     Degree measures direct connections. **PageRank** measures attention received
@@ -1154,7 +1649,7 @@ def describe_node_centrality():
     nodes' mass uniformly. HITS scores are normalized to sum to one. Scores from
     different methods have different scales: compare their ranks.
     """)
-    return
+    return (centrality_method_notes,)
 
 
 @app.function(hide_code=True)
@@ -1297,12 +1792,6 @@ def select_centrality_measure(centrality_methods):
     centrality_top_count = mo.ui.slider(
         start=10, stop=50, step=10, value=20, label="Top nodes", full_width=True
     )
-    mo.vstack(
-        [
-            mo.md("### Centrality controls"),
-            topic_widget_grid([centrality_method_selector, centrality_top_count]),
-        ]
-    )
     return centrality_method_selector, centrality_top_count
 
 
@@ -1341,7 +1830,7 @@ def display_node_centrality(
         )
         .properties(
             width="container",
-            height=centrality_top_count.value * 20,
+            height=min(520, max(300, centrality_top_count.value * 20)),
             title=f"Top nodes by {_method}",
         )
     )
@@ -1371,14 +1860,14 @@ def display_node_centrality(
             )
             .properties(
                 width="container",
-                height=centrality_top_count.value * 20,
+                height=min(520, max(300, centrality_top_count.value * 20)),
                 title="Distribution of positive scores",
             )
         )
         _distribution_outputs.append(
             mo.ui.altair_chart(_hist, chart_selection=False, legend_selection=False)
         )
-    mo.vstack(
+    centrality_ranking_view = mo.vstack(
         [
             mo.md(f"### {_method}"),
             topic_widget_grid(
@@ -1394,7 +1883,7 @@ def display_node_centrality(
                         [
                             mo.ui.altair_chart(
                                 _bar, chart_selection=False, legend_selection=False
-                            ),
+                            )
                         ]
                     ),
                     mo.vstack(
@@ -1402,7 +1891,7 @@ def display_node_centrality(
                         or [
                             mo.md(
                                 "No positive scores are available for a logarithmic distribution."
-                            ),
+                            )
                         ]
                     ),
                 ],
@@ -1413,16 +1902,20 @@ def display_node_centrality(
             mo.md(
                 "Zero scores are counted above and excluded from the logarithmic histogram. Top 1% uses ceil(0.01 × N) nodes. Equal scores are ordered by node ID for display; ranks used below average ties."
             ),
-            mo.ui.table(
-                _top.drop("account"),
-                selection=None,
-                pagination=True,
-                show_data_types=False,
-                show_column_summaries=False,
+            mo.accordion(
+                {
+                    "Ranking table": mo.ui.table(
+                        _top.drop("account"),
+                        selection=None,
+                        pagination=True,
+                        show_data_types=False,
+                        show_column_summaries=False,
+                    )
+                }
             ),
         ]
     )
-    return
+    return (centrality_ranking_view,)
 
 
 @app.cell(hide_code=True)
@@ -1436,19 +1929,6 @@ def control_pagerank_network():
         label="Top connected neighbors per PageRank node",
     )
     pagerank_network_labels = mo.ui.checkbox(value=False, label="Show all node IDs")
-    mo.vstack(
-        [
-            mo.md("### Network of top PageRank nodes"),
-            topic_widget_grid([pagerank_network_neighbors, pagerank_network_labels]),
-            mo.md(
-                "The **Top nodes** control above sets how many accounts are selected by PageRank. "
-                "For each account, add the most-connected nodes it follows, ranked by total "
-                "incoming + outgoing connections in this dataset. Ties use PageRank, then node ID. "
-                "The plot includes all observed directed edges between the displayed nodes. "
-                "This view always uses PageRank, regardless of the centrality measure selected above."
-            ),
-        ]
-    )
     return pagerank_network_labels, pagerank_network_neighbors
 
 
@@ -1565,121 +2045,130 @@ def compute_pagerank_network(
 
 @app.cell(hide_code=True)
 def display_pagerank_network(pagerank_network_data, pagerank_network_labels):
-    _network = pagerank_network_data
-    mo.stop(
-        not _network["nodes"], mo.md("No nodes are available for the PageRank network.")
-    )
-    _x = alt.X("x:Q", axis=None, scale=alt.Scale(zero=False, padding=35))
-    _y = alt.Y("y:Q", axis=None, scale=alt.Scale(zero=False, padding=35))
-    _edge_tooltip = [
-        alt.Tooltip("source:N", title="From (follower)"),
-        alt.Tooltip("target:N", title="To (followed account)"),
-        alt.Tooltip("relationship:N", title="Relationship"),
-    ]
-    _links = (
-        alt.Chart(alt.Data(values=_network["links"]))
-        .mark_rule(
-            opacity=0.35,
-            strokeWidth=0.8,
-        )
-        .encode(
-            x=_x,
-            y=_y,
-            x2="x2:Q",
-            y2="y2:Q",
-            color=alt.Color("color:N", scale=None, legend=None),
-            tooltip=_edge_tooltip,
-        )
-    )
-    _arrows = (
-        alt.Chart(alt.Data(values=_network["arrows"]))
-        .mark_point(
-            shape="triangle-up",
-            filled=True,
-            size=28,
-            opacity=0.7,
-            angle=alt.ExprRef(
-                expr="atan2(scale('x', datum.x2) - scale('x', datum.x), scale('y', datum.y) - scale('y', datum.y2)) * 180 / PI"
-            ),
-        )
-        .encode(
-            x=_x,
-            y=_y,
-            color=alt.Color("color:N", scale=None, legend=None),
-            tooltip=_edge_tooltip,
-        )
-    )
-    _node_base = alt.Chart(alt.Data(values=_network["nodes"]))
-    _nodes = _node_base.mark_circle(stroke="white", strokeWidth=1.3, opacity=1).encode(
-        x=_x,
-        y=_y,
-        size=alt.Size("size:Q", scale=None, legend=None),
-        color=alt.Color(
-            "role:N",
-            title="Node group",
-            scale=alt.Scale(
-                domain=["Top PageRank node", "Connected neighbor"],
-                range=["#f59e0b", "#3b82f6"],
-            ),
-            legend=alt.Legend(orient="bottom"),
-        ),
-        tooltip=[
-            alt.Tooltip("node:N", title="Node ID"),
-            alt.Tooltip("role:N", title="Group"),
-            alt.Tooltip("rank:Q", title="Global PageRank rank", format=",d"),
-            alt.Tooltip("pagerank:Q", title="PageRank", format=".6g"),
-            alt.Tooltip("incoming:Q", title="Incoming connections", format=",d"),
-            alt.Tooltip("outgoing:Q", title="Outgoing connections", format=",d"),
-            alt.Tooltip("connections:Q", title="Total connections", format=",d"),
-        ],
-    )
-    _labels = (
-        _node_base.transform_filter(
-            "true"
-            if pagerank_network_labels.value
-            else alt.datum.role == "Top PageRank node"
-        )
-        .mark_text(dy=-17, fontSize=10, color="#475569")
-        .encode(x=_x, y=_y, text="node:N")
-    )
-    pagerank_network_chart = (
-        alt.layer(_links, _arrows, _nodes, _labels)
-        .properties(
-            width="container",
-            height=580,
-            title=f"Top {_network['top_nodes']} PageRank nodes and their connected neighbors",
-        )
-        .resolve_scale(color="independent")
-        .configure_view(stroke=None)
-        .interactive()
-    )
-    mo.vstack(
-        [
-            topic_widget_grid(
-                [
-                    mo.stat(f"{_network['top_nodes']:,}", label="Top PageRank nodes"),
-                    mo.stat(
-                        f"{_network['neighbors']:,}", label="Additional connected nodes"
-                    ),
-                    mo.stat(
-                        f"{_network['directed_edges']:,}",
-                        label="Displayed directed edges",
-                    ),
-                ]
-            ),
-            mo.ui.altair_chart(
-                pagerank_network_chart, chart_selection=False, legend_selection=False
-            ),
-            mo.md(
-                "Orange nodes are the top PageRank accounts; blue nodes are their selected outgoing neighbors. "
-                "Node size represents PageRank. Arrows point from follower to followed account; teal edges are "
-                "mutual and gray edges are one-way. Hover for node IDs, PageRank, and connection counts. "
-                "Scroll to zoom, drag to pan, and double-click to reset. Shared neighbors appear once, "
-                "and every ranked node is retained even if it has no outgoing connections. Self-loops are omitted."
-            ),
+    def _build_panel():
+        _network = pagerank_network_data
+        if not _network["nodes"]:
+            return mo.md("No nodes are available for the PageRank network.")
+        _x = alt.X("x:Q", axis=None, scale=alt.Scale(zero=False, padding=35))
+        _y = alt.Y("y:Q", axis=None, scale=alt.Scale(zero=False, padding=35))
+        _edge_tooltip = [
+            alt.Tooltip("source:N", title="From (follower)"),
+            alt.Tooltip("target:N", title="To (followed account)"),
+            alt.Tooltip("relationship:N", title="Relationship"),
         ]
-    )
-    return
+        _links = (
+            alt.Chart(alt.Data(values=_network["links"]))
+            .mark_rule(
+                opacity=0.35,
+                strokeWidth=0.8,
+            )
+            .encode(
+                x=_x,
+                y=_y,
+                x2="x2:Q",
+                y2="y2:Q",
+                color=alt.Color("color:N", scale=None, legend=None),
+                tooltip=_edge_tooltip,
+            )
+        )
+        _arrows = (
+            alt.Chart(alt.Data(values=_network["arrows"]))
+            .mark_point(
+                shape="triangle-up",
+                filled=True,
+                size=28,
+                opacity=0.7,
+                angle=alt.ExprRef(
+                    expr="atan2(scale('x', datum.x2) - scale('x', datum.x), scale('y', datum.y) - scale('y', datum.y2)) * 180 / PI"
+                ),
+            )
+            .encode(
+                x=_x,
+                y=_y,
+                color=alt.Color("color:N", scale=None, legend=None),
+                tooltip=_edge_tooltip,
+            )
+        )
+        _node_base = alt.Chart(alt.Data(values=_network["nodes"]))
+        _nodes = _node_base.mark_circle(
+            stroke="white", strokeWidth=1.3, opacity=1
+        ).encode(
+            x=_x,
+            y=_y,
+            size=alt.Size("size:Q", scale=None, legend=None),
+            color=alt.Color(
+                "role:N",
+                title="Node group",
+                scale=alt.Scale(
+                    domain=["Top PageRank node", "Connected neighbor"],
+                    range=["#f59e0b", "#3b82f6"],
+                ),
+                legend=alt.Legend(orient="bottom"),
+            ),
+            tooltip=[
+                alt.Tooltip("node:N", title="Node ID"),
+                alt.Tooltip("role:N", title="Group"),
+                alt.Tooltip("rank:Q", title="Global PageRank rank", format=",d"),
+                alt.Tooltip("pagerank:Q", title="PageRank", format=".6g"),
+                alt.Tooltip("incoming:Q", title="Incoming connections", format=",d"),
+                alt.Tooltip("outgoing:Q", title="Outgoing connections", format=",d"),
+                alt.Tooltip("connections:Q", title="Total connections", format=",d"),
+            ],
+        )
+        _labels = (
+            _node_base.transform_filter(
+                "true"
+                if pagerank_network_labels.value
+                else alt.datum.role == "Top PageRank node"
+            )
+            .mark_text(dy=-17, fontSize=10, color="#475569")
+            .encode(x=_x, y=_y, text="node:N")
+        )
+        pagerank_network_chart = (
+            alt.layer(_links, _arrows, _nodes, _labels)
+            .properties(
+                width="container",
+                height=480,
+                title=f"Top {_network['top_nodes']} PageRank nodes and their connected neighbors",
+            )
+            .resolve_scale(color="independent")
+            .configure_view(stroke=None)
+            .interactive()
+        )
+        return mo.vstack(
+            [
+                topic_widget_grid(
+                    [
+                        mo.stat(
+                            f"{_network['top_nodes']:,}", label="Top PageRank nodes"
+                        ),
+                        mo.stat(
+                            f"{_network['neighbors']:,}",
+                            label="Additional connected nodes",
+                        ),
+                        mo.stat(
+                            f"{_network['directed_edges']:,}",
+                            label="Displayed directed edges",
+                        ),
+                    ]
+                ),
+                mo.ui.altair_chart(
+                    pagerank_network_chart,
+                    chart_selection=False,
+                    legend_selection=False,
+                ),
+                mo.md(
+                    "Orange nodes are the top PageRank accounts; blue nodes are their selected outgoing neighbors. "
+                    "Node size represents PageRank. Arrows point from follower to followed account; teal edges are "
+                    "mutual and gray edges are one-way. Hover for node IDs, PageRank, and connection counts. "
+                    "Scroll to zoom, drag to pan, and double-click to reset. Shared neighbors appear once, "
+                    "and every ranked node is retained even if it has no outgoing connections. Self-loops are omitted."
+                ),
+            ]
+        )
+
+    pagerank_network_view = _build_panel()
+    return (pagerank_network_view,)
 
 
 @app.cell(hide_code=True)
@@ -1723,7 +2212,7 @@ def compare_centrality_rankings(
     _hub_leader = centrality_scores.sort(
         ["HITS hub", "node"], descending=[True, False]
     ).row(0, named=True)
-    mo.vstack(
+    centrality_agreement_view = mo.vstack(
         [
             mo.md(
                 f"### Comparing rankings\n\nNode **{_pr_leader['node']}** leads PageRank; node **{_authority_leader['node']}** leads HITS authority; node **{_hub_leader['node']}** leads HITS hub. The heatmap compares rankings over all nodes, including tied scores. Correlation near 1 means similar ordering; near 0 means little monotonic agreement."
@@ -1743,12 +2232,12 @@ def compare_centrality_rankings(
             ),
         ]
     )
-    return
+    return (centrality_agreement_view,)
 
 
 @app.cell(hide_code=True)
 def describe_components_and_reciprocity():
-    mo.md(r"""
+    connectivity_method_notes = mo.md(r"""
     ## 3. Components and reciprocity
 
     A **weak component** connects nodes when edge direction is ignored. In a
@@ -1761,7 +2250,7 @@ def describe_components_and_reciprocity():
     density, and all reciprocity measures. Here, an **isolate** has no relationship
     to another node. Results describe this observed dataset.
     """)
-    return
+    return (connectivity_method_notes,)
 
 
 @app.cell(hide_code=True)
@@ -1976,7 +2465,7 @@ def compute_components_and_reciprocity(
 def display_component_overview(component_summary, network_structure_totals):
     _weak = component_summary.filter(pl.col("kind") == "Weak").row(0, named=True)
     _strong = component_summary.filter(pl.col("kind") == "Strong").row(0, named=True)
-    mo.vstack(
+    component_overview_view = mo.vstack(
         [
             topic_widget_grid(
                 [
@@ -2012,7 +2501,7 @@ def display_component_overview(component_summary, network_structure_totals):
             ),
         ]
     )
-    return
+    return (component_overview_view,)
 
 
 @app.cell(hide_code=True)
@@ -2022,12 +2511,6 @@ def select_component_connectivity():
         value="Strong",
         label="Component definition",
         full_width=True,
-    )
-    mo.vstack(
-        [
-            mo.md("### Component controls"),
-            topic_widget_grid([component_type_selector]),
-        ]
     )
     return (component_type_selector,)
 
@@ -2095,7 +2578,7 @@ def display_component_size_distributions(
             height=300,
         )
     )
-    mo.vstack(
+    component_distribution_view = mo.vstack(
         [
             mo.hstack(
                 [
@@ -2146,7 +2629,7 @@ def display_component_size_distributions(
             ),
         ]
     )
-    return
+    return (component_distribution_view,)
 
 
 @app.cell(hide_code=True)
@@ -2196,7 +2679,7 @@ def display_global_reciprocity(
         width="container",
         height=150,
     )
-    mo.vstack(
+    global_reciprocity_view = mo.vstack(
         [
             mo.md("### Reciprocity across the network"),
             topic_widget_grid(
@@ -2237,7 +2720,7 @@ def display_global_reciprocity(
             ),
         ]
     )
-    return
+    return (global_reciprocity_view,)
 
 
 @app.cell(hide_code=True)
@@ -2297,7 +2780,7 @@ def display_node_reciprocity_distributions(
                 ),
             ]
         )
-    mo.vstack(
+    node_reciprocity_view = mo.vstack(
         [
             mo.md("### Reciprocity for individual nodes"),
             mo.md(
@@ -2318,7 +2801,7 @@ def display_node_reciprocity_distributions(
                     "fully_reciprocated_nodes": "{:,}",
                 },
             ),
-            mo.ui.tabs(_tabs),
+            mo.hstack(list(_tabs.values()), widths="equal", align="start", gap=1.5),
             mo.accordion(
                 {
                     "Per-node reciprocity data": mo.ui.table(
@@ -2339,12 +2822,12 @@ def display_node_reciprocity_distributions(
             ),
         ]
     )
-    return
+    return (node_reciprocity_view,)
 
 
 @app.cell(hide_code=True)
 def describe_combined_feature_pagerank():
-    mo.md(r"""
+    feature_model_notes = mo.md(r"""
     ## 4. Feature PageRank in the combined network
 
     This graph contains **account nodes** and **feature nodes**. It retains directed
@@ -2362,7 +2845,7 @@ def describe_combined_feature_pagerank():
     connectivity under this walk, not causal influence. Missing annotations are
     unobserved data, not evidence that an account lacks a feature.
     """)
-    return
+    return (feature_model_notes,)
 
 
 @app.cell(hide_code=True)
@@ -2389,24 +2872,7 @@ def control_combined_feature_pagerank():
         step=1,
         value=1,
         full_width=True,
-        label="Minimum accounts with feature (display only)",
-    )
-    mo.vstack(
-        [
-            mo.md("### Feature ranking controls"),
-            topic_widget_grid(
-                [
-                    feature_pagerank_social_share,
-                    feature_pagerank_top_count,
-                    feature_pagerank_min_accounts,
-                ]
-            ),
-            mo.md(
-                "The walk-share control changes the model and recomputes PageRank. "
-                "The other controls only change the displayed results. The complementary "
-                "share goes to features; accounts with only one edge type use that type."
-            ),
-        ]
+        label="Minimum accounts per feature (views and clustering)",
     )
     return (
         feature_pagerank_min_accounts,
@@ -2690,19 +3156,19 @@ def display_feature_pagerank_analysis(
     feature_pagerank_scores,
     feature_pagerank_top_count,
 ):
-    _summary = feature_pagerank_graph_summary
-    _diagnostics = feature_pagerank_diagnostics
-    _eligible = feature_pagerank_scores.filter(
-        pl.col("account_count") >= feature_pagerank_min_accounts.value
-    )
-    _top = _eligible.head(feature_pagerank_top_count.value)
-    _correlation = (
-        f"{feature_pagerank_frequency_correlation:.3f}"
-        if feature_pagerank_frequency_correlation is not None
-        else "Undefined"
-    )
-    mo.output.append(
-        mo.vstack(
+    def _build_panel():
+        _summary = feature_pagerank_graph_summary
+        _diagnostics = feature_pagerank_diagnostics
+        _eligible = feature_pagerank_scores.filter(
+            pl.col("account_count") >= feature_pagerank_min_accounts.value
+        )
+        _top = _eligible.head(feature_pagerank_top_count.value)
+        _correlation = (
+            f"{feature_pagerank_frequency_correlation:.3f}"
+            if feature_pagerank_frequency_correlation is not None
+            else "Undefined"
+        )
+        _overview_0 = mo.vstack(
             [
                 topic_widget_grid(
                     [
@@ -2736,204 +3202,218 @@ def display_feature_pagerank_analysis(
                 ),
             ]
         )
-    )
-    mo.stop(
-        _diagnostics["feature_mass"] <= 0,
-        mo.md(
-            "No PageRank mass reaches features at this walk share. Reduce the share on following edges."
-        ),
-    )
-    mo.stop(
-        _top.is_empty(),
-        mo.md("No features meet the minimum account count. Lower the display filter."),
-    )
-    feature_pagerank_top_chart = (
-        alt.Chart(_top)
-        .mark_bar(color="#2563a6")
-        .encode(
-            x=alt.X(
-                "feature_share:Q",
-                title="Share of feature PageRank",
-                axis=alt.Axis(format=".1%"),
-            ),
-            y=alt.Y(
-                "name:N",
-                title=None,
-                sort=_top["name"].to_list(),
-                axis=alt.Axis(labelLimit=180),
-            ),
-            tooltip=[
-                alt.Tooltip("name:N", title="Feature"),
-                alt.Tooltip("id:Q", title="Feature ID", format="d"),
-                alt.Tooltip(
-                    "feature_share:Q", title="Feature PageRank share", format=".4%"
+        if _diagnostics["feature_mass"] <= 0:
+            return mo.vstack(
+                [
+                    _overview_0,
+                    mo.md(
+                        "No PageRank mass reaches features at this walk share. Reduce the share on following edges."
+                    ),
+                ]
+            )
+        if _top.is_empty():
+            return mo.vstack(
+                [
+                    _overview_0,
+                    mo.md(
+                        "No features meet the minimum account count. Lower the display filter."
+                    ),
+                ]
+            )
+        feature_pagerank_top_chart = (
+            alt.Chart(_top)
+            .mark_bar(color="#2563a6")
+            .encode(
+                x=alt.X(
+                    "feature_share:Q",
+                    title="Share of feature PageRank",
+                    axis=alt.Axis(format=".1%"),
                 ),
-                alt.Tooltip("account_count:Q", title="Accounts", format=",d"),
-                alt.Tooltip(
-                    "share_lift:Q", title="Share / frequency share", format=".2f"
+                y=alt.Y(
+                    "name:N",
+                    title=None,
+                    sort=_top["name"].to_list(),
+                    axis=alt.Axis(labelLimit=180),
                 ),
-                alt.Tooltip(
-                    "rank_gain:Q", title="Rank gain over frequency", format=",.1f"
-                ),
-            ],
+                tooltip=[
+                    alt.Tooltip("name:N", title="Feature"),
+                    alt.Tooltip("id:Q", title="Feature ID", format="d"),
+                    alt.Tooltip(
+                        "feature_share:Q", title="Feature PageRank share", format=".4%"
+                    ),
+                    alt.Tooltip("account_count:Q", title="Accounts", format=",d"),
+                    alt.Tooltip(
+                        "share_lift:Q", title="Share / frequency share", format=".2f"
+                    ),
+                    alt.Tooltip(
+                        "rank_gain:Q", title="Rank gain over frequency", format=",.1f"
+                    ),
+                ],
+            )
+            .properties(
+                title="Top features by combined PageRank",
+                width="container",
+                height=min(600, max(300, _top.height * 22)),
+            )
         )
-        .properties(
-            title="Top features by combined PageRank",
-            width="container",
-            height=max(300, _top.height * 22),
+        _positive = _eligible.filter(pl.col("feature_share") > 0)
+        _stride = max(1, int(np.ceil(_positive.height / 2500)))
+        _sample = (
+            _positive.sort("id")
+            .with_row_index("sample_index")
+            .filter(pl.col("sample_index") % _stride == 0)
+            .drop("sample_index")
         )
-    )
-    _positive = _eligible.filter(pl.col("feature_share") > 0)
-    _stride = max(1, int(np.ceil(_positive.height / 2500)))
-    _sample = (
-        _positive.sort("id")
-        .with_row_index("sample_index")
-        .filter(pl.col("sample_index") % _stride == 0)
-        .drop("sample_index")
-    )
-    _sample = (
-        pl.concat(
+        _sample = (
+            pl.concat(
+                [
+                    _sample,
+                    _top,
+                    _eligible.sort(
+                        ["account_count", "id"], descending=[True, False]
+                    ).head(20),
+                ]
+            )
+            .unique("id")
+            .filter(pl.col("feature_share") > 0)
+        )
+        _sample = _sample.with_columns(
+            pl.when(pl.col("id").is_in(_top["id"].implode()))
+            .then(pl.lit("Top features"))
+            .otherwise(pl.lit("Other sampled features"))
+            .alias("feature_group")
+        )
+        feature_pagerank_frequency_chart = (
+            alt.Chart(_sample)
+            .mark_circle(size=35, opacity=0.6)
+            .encode(
+                x=alt.X(
+                    "account_count:Q",
+                    title="Accounts with feature (log scale)",
+                    scale=alt.Scale(type="log"),
+                ),
+                y=alt.Y(
+                    "feature_share:Q",
+                    title="Feature PageRank share (log scale)",
+                    scale=alt.Scale(type="log"),
+                    axis=alt.Axis(format=".1e", tickCount=6),
+                ),
+                color=alt.Color(
+                    "feature_group:N",
+                    title="Feature group",
+                    scale=alt.Scale(
+                        domain=["Other sampled features", "Top features"],
+                        range=["#2563a6", "#f59e0b"],
+                    ),
+                    legend=alt.Legend(orient="bottom"),
+                ),
+                tooltip=[
+                    alt.Tooltip("name:N", title="Feature"),
+                    alt.Tooltip("account_count:Q", title="Accounts", format=",d"),
+                    alt.Tooltip(
+                        "feature_share:Q", title="Feature PageRank share", format=".4%"
+                    ),
+                    alt.Tooltip(
+                        "share_lift:Q", title="Share / frequency share", format=".2f"
+                    ),
+                ],
+            )
+            .properties(
+                title="Frequency versus combined PageRank",
+                width="container",
+                height=min(600, max(300, _top.height * 22)),
+            )
+            .interactive()
+        )
+        return mo.vstack(
             [
-                _sample,
-                _top,
-                _eligible.sort(["account_count", "id"], descending=[True, False]).head(
-                    20
+                _overview_0,
+                mo.vstack(
+                    [
+                        mo.hstack(
+                            [
+                                mo.vstack(
+                                    [
+                                        mo.ui.altair_chart(
+                                            feature_pagerank_top_chart,
+                                            chart_selection=False,
+                                            legend_selection=False,
+                                        )
+                                    ]
+                                ),
+                                mo.vstack(
+                                    [
+                                        mo.ui.altair_chart(
+                                            feature_pagerank_frequency_chart,
+                                            chart_selection=False,
+                                            legend_selection=False,
+                                        )
+                                    ]
+                                ),
+                            ],
+                            widths="equal",
+                            align="start",
+                            gap=1.5,
+                        ),
+                        mo.md(
+                            f"Showing **{_top.height:,} of {_eligible.height:,} eligible features**. The scatter displays **{_sample.height:,} features**, using a deterministic sample plus the highest PageRank and frequency features. The correlation uses every observed feature, regardless of display filters. A share lift above 1 means more feature PageRank share than its share of all recorded memberships; it is a descriptive comparison, not a significance test."
+                        ),
+                        mo.accordion(
+                            {
+                                "Ranking table": mo.ui.table(
+                                    _top.select(
+                                        "id",
+                                        "name",
+                                        "account_count",
+                                        "account_coverage",
+                                        "pagerank",
+                                        "feature_share",
+                                        "frequency_share",
+                                        "pagerank_rank",
+                                        "frequency_rank",
+                                        "rank_gain",
+                                        "share_lift",
+                                    ),
+                                    selection=None,
+                                    pagination=True,
+                                    page_size=10,
+                                    show_data_types=False,
+                                    show_column_summaries=False,
+                                    format_mapping={
+                                        "account_coverage": "{:.2%}",
+                                        "pagerank": "{:.6g}",
+                                        "feature_share": "{:.4%}",
+                                        "frequency_share": "{:.4%}",
+                                        "share_lift": "{:.2f}",
+                                        "rank_gain": "{:+,.1f}",
+                                    },
+                                )
+                            }
+                        ),
+                        mo.accordion(
+                            {
+                                "All feature scores": mo.ui.table(
+                                    feature_pagerank_scores,
+                                    selection=None,
+                                    pagination=True,
+                                    page_size=10,
+                                    show_data_types=False,
+                                    show_column_summaries=False,
+                                    format_mapping={
+                                        "feature_share": "{:.4%}",
+                                        "share_lift": "{:.2f}",
+                                        "pagerank": "{:.6g}",
+                                    },
+                                )
+                            }
+                        ),
+                    ]
                 ),
             ]
         )
-        .unique("id")
-        .filter(pl.col("feature_share") > 0)
-    )
-    _sample = _sample.with_columns(
-        pl.when(pl.col("id").is_in(_top["id"].implode()))
-        .then(pl.lit("Top features"))
-        .otherwise(pl.lit("Other sampled features"))
-        .alias("feature_group")
-    )
-    feature_pagerank_frequency_chart = (
-        alt.Chart(_sample)
-        .mark_circle(size=35, opacity=0.6)
-        .encode(
-            x=alt.X(
-                "account_count:Q",
-                title="Accounts with feature (log scale)",
-                scale=alt.Scale(type="log"),
-            ),
-            y=alt.Y(
-                "feature_share:Q",
-                title="Feature PageRank share (log scale)",
-                scale=alt.Scale(type="log"),
-                axis=alt.Axis(format=".1e", tickCount=6),
-            ),
-            color=alt.Color(
-                "feature_group:N",
-                title="Feature group",
-                scale=alt.Scale(
-                    domain=["Other sampled features", "Top features"],
-                    range=["#2563a6", "#f59e0b"],
-                ),
-                legend=alt.Legend(orient="bottom"),
-            ),
-            tooltip=[
-                alt.Tooltip("name:N", title="Feature"),
-                alt.Tooltip("account_count:Q", title="Accounts", format=",d"),
-                alt.Tooltip(
-                    "feature_share:Q", title="Feature PageRank share", format=".4%"
-                ),
-                alt.Tooltip(
-                    "share_lift:Q", title="Share / frequency share", format=".2f"
-                ),
-            ],
-        )
-        .properties(
-            title="Frequency versus combined PageRank",
-            width="container",
-            height=max(300, _top.height * 22),
-        )
-        .interactive()
-    )
-    mo.vstack(
-        [
-            mo.hstack(
-                [
-                    mo.vstack(
-                        [
-                            mo.ui.altair_chart(
-                                feature_pagerank_top_chart,
-                                chart_selection=False,
-                                legend_selection=False,
-                            )
-                        ]
-                    ),
-                    mo.vstack(
-                        [
-                            mo.ui.altair_chart(
-                                feature_pagerank_frequency_chart,
-                                chart_selection=False,
-                                legend_selection=False,
-                            )
-                        ]
-                    ),
-                ],
-                widths="equal",
-                align="start",
-                gap=1.5,
-            ),
-            mo.md(
-                f"Showing **{_top.height:,} of {_eligible.height:,} eligible features**. "
-                f"The scatter displays **{_sample.height:,} features**, using a deterministic sample plus the highest PageRank and frequency features. "
-                "The correlation uses every observed feature, regardless of display filters. "
-                "A share lift above 1 means more feature PageRank share than its share of all recorded memberships; "
-                "it is a descriptive comparison, not a significance test."
-            ),
-            mo.ui.table(
-                _top.select(
-                    "id",
-                    "name",
-                    "account_count",
-                    "account_coverage",
-                    "pagerank",
-                    "feature_share",
-                    "frequency_share",
-                    "pagerank_rank",
-                    "frequency_rank",
-                    "rank_gain",
-                    "share_lift",
-                ),
-                selection=None,
-                pagination=True,
-                page_size=10,
-                show_data_types=False,
-                show_column_summaries=False,
-                format_mapping={
-                    "account_coverage": "{:.2%}",
-                    "pagerank": "{:.6g}",
-                    "feature_share": "{:.4%}",
-                    "frequency_share": "{:.4%}",
-                    "share_lift": "{:.2f}",
-                    "rank_gain": "{:+,.1f}",
-                },
-            ),
-            mo.accordion(
-                {
-                    "All feature scores": mo.ui.table(
-                        feature_pagerank_scores,
-                        selection=None,
-                        pagination=True,
-                        page_size=10,
-                        show_data_types=False,
-                        show_column_summaries=False,
-                        format_mapping={
-                            "feature_share": "{:.4%}",
-                            "share_lift": "{:.2f}",
-                            "pagerank": "{:.6g}",
-                        },
-                    )
-                }
-            ),
-        ]
-    )
-    return
+
+    feature_ranking_view = _build_panel()
+    return (feature_ranking_view,)
 
 
 @app.cell(hide_code=True)
@@ -2957,26 +3437,6 @@ def control_top_feature_network():
     )
     feature_network_account_labels = mo.ui.checkbox(
         value=False, label="Show account IDs on the plot"
-    )
-    mo.vstack(
-        [
-            mo.md("### Network of top features and accounts"),
-            topic_widget_grid(
-                [
-                    feature_network_accounts_per_feature,
-                    feature_network_account_ranking,
-                    feature_network_social_edges,
-                    feature_network_account_labels,
-                ]
-            ),
-            mo.md(
-                "Uses the **Top features to display** and **Minimum accounts with feature** controls above. "
-                "For each top-ranked feature, select accounts that have it; shared accounts appear once. "
-                "PageRank selection uses account scores from the combined graph. Connection-count selection "
-                "uses incoming + outgoing social edges, with PageRank and node ID breaking ties. "
-                "Scores are computed on the full combined graph, not recomputed on this displayed subset."
-            ),
-        ]
     )
     return (
         feature_network_account_labels,
@@ -3219,149 +3679,155 @@ def display_top_feature_network(
     feature_network_plot_data,
     feature_pagerank_diagnostics,
 ):
-    _network = feature_network_plot_data
-    mo.stop(
-        feature_pagerank_diagnostics["feature_mass"] <= 0,
-        mo.md(
-            "No PageRank mass reaches features. Reduce the following-edge walk share above."
-        ),
-    )
-    mo.stop(
-        not _network["nodes"],
-        mo.md(
-            "No features meet the selected minimum account count. Lower the display filter above."
-        ),
-    )
-    _x = alt.X("x:Q", axis=None, scale=alt.Scale(zero=False, padding=40))
-    _y = alt.Y("y:Q", axis=None, scale=alt.Scale(zero=False, padding=40))
-    _links = (
-        alt.Chart(alt.Data(values=_network["links"]))
-        .mark_rule(opacity=0.4, strokeWidth=1)
-        .encode(
+    def _build_panel():
+        _network = feature_network_plot_data
+        if feature_pagerank_diagnostics["feature_mass"] <= 0:
+            return mo.md(
+                "No PageRank mass reaches features. Reduce the following-edge walk share above."
+            )
+        if not _network["nodes"]:
+            return mo.md(
+                "No features meet the selected minimum account count. Lower the display filter above."
+            )
+        _x = alt.X("x:Q", axis=None, scale=alt.Scale(zero=False, padding=40))
+        _y = alt.Y("y:Q", axis=None, scale=alt.Scale(zero=False, padding=40))
+        _links = (
+            alt.Chart(alt.Data(values=_network["links"]))
+            .mark_rule(opacity=0.4, strokeWidth=1)
+            .encode(
+                x=_x,
+                y=_y,
+                x2="x2:Q",
+                y2="y2:Q",
+                color=alt.Color(
+                    "edge_type:N",
+                    title="Connection type",
+                    scale=alt.Scale(
+                        domain=[
+                            "Account–feature membership",
+                            "Account follows account",
+                        ],
+                        range=["#8b5cf6", "#94a3b8"],
+                    ),
+                    legend=alt.Legend(orient="bottom"),
+                ),
+                tooltip=[
+                    alt.Tooltip("source_label:N", title="From / account"),
+                    alt.Tooltip("target_label:N", title="To / feature"),
+                    alt.Tooltip("edge_type:N", title="Connection"),
+                    alt.Tooltip("direction:N", title="Direction"),
+                ],
+            )
+        )
+        _arrows = (
+            alt.Chart(alt.Data(values=_network["arrows"]))
+            .mark_point(
+                shape="triangle-up",
+                color="#94a3b8",
+                filled=True,
+                size=28,
+                opacity=0.75,
+                angle=alt.ExprRef(
+                    expr="atan2(scale('x', datum.x2) - scale('x', datum.x), scale('y', datum.y) - scale('y', datum.y2)) * 180 / PI"
+                ),
+            )
+            .encode(
+                x=_x,
+                y=_y,
+                tooltip=[
+                    alt.Tooltip("source_label:N", title="Follower"),
+                    alt.Tooltip("target_label:N", title="Followed account"),
+                ],
+            )
+        )
+        _node_base = alt.Chart(alt.Data(values=_network["nodes"]))
+        _nodes = _node_base.mark_point(
+            filled=True, stroke="white", strokeWidth=1.3, opacity=1
+        ).encode(
             x=_x,
             y=_y,
-            x2="x2:Q",
-            y2="y2:Q",
+            size=alt.Size("size:Q", scale=None, legend=None),
             color=alt.Color(
-                "edge_type:N",
-                title="Connection type",
+                "kind:N",
+                title="Node type",
                 scale=alt.Scale(
-                    domain=["Account–feature membership", "Account follows account"],
-                    range=["#8b5cf6", "#94a3b8"],
+                    domain=["Feature", "Account"], range=["#f59e0b", "#3b82f6"]
                 ),
                 legend=alt.Legend(orient="bottom"),
             ),
+            shape=alt.Shape(
+                "kind:N",
+                title="Node type",
+                scale=alt.Scale(
+                    domain=["Feature", "Account"], range=["diamond", "circle"]
+                ),
+                legend=None,
+            ),
             tooltip=[
-                alt.Tooltip("source_label:N", title="From / account"),
-                alt.Tooltip("target_label:N", title="To / feature"),
-                alt.Tooltip("edge_type:N", title="Connection"),
-                alt.Tooltip("direction:N", title="Direction"),
+                alt.Tooltip("kind:N", title="Node type"),
+                alt.Tooltip("name:N", title="Feature / account"),
+                alt.Tooltip("id:N", title="Original ID"),
+                alt.Tooltip("pagerank:Q", title="Combined PageRank", format=".6g"),
+                alt.Tooltip("details:N", title="Details"),
             ],
         )
-    )
-    _arrows = (
-        alt.Chart(alt.Data(values=_network["arrows"]))
-        .mark_point(
-            shape="triangle-up",
-            color="#94a3b8",
-            filled=True,
-            size=28,
-            opacity=0.75,
-            angle=alt.ExprRef(
-                expr="atan2(scale('x', datum.x2) - scale('x', datum.x), scale('y', datum.y) - scale('y', datum.y2)) * 180 / PI"
-            ),
+        _labels = (
+            _node_base.transform_filter(
+                "true"
+                if feature_network_account_labels.value
+                else alt.datum.kind == "Feature"
+            )
+            .mark_text(dy=-17, fontSize=10, color="#475569")
+            .encode(x=_x, y=_y, text="label:N")
         )
-        .encode(
-            x=_x,
-            y=_y,
-            tooltip=[
-                alt.Tooltip("source_label:N", title="Follower"),
-                alt.Tooltip("target_label:N", title="Followed account"),
-            ],
+        feature_network_chart = (
+            alt.layer(_links, _arrows, _nodes, _labels)
+            .properties(
+                width="container",
+                height=480,
+                title=f"Top {_network['features']} features and their connected accounts",
+            )
+            .resolve_scale(color="independent")
+            .configure_view(stroke=None)
+            .interactive()
         )
-    )
-    _node_base = alt.Chart(alt.Data(values=_network["nodes"]))
-    _nodes = _node_base.mark_point(
-        filled=True, stroke="white", strokeWidth=1.3, opacity=1
-    ).encode(
-        x=_x,
-        y=_y,
-        size=alt.Size("size:Q", scale=None, legend=None),
-        color=alt.Color(
-            "kind:N",
-            title="Node type",
-            scale=alt.Scale(
-                domain=["Feature", "Account"], range=["#f59e0b", "#3b82f6"]
-            ),
-            legend=alt.Legend(orient="bottom"),
-        ),
-        shape=alt.Shape(
-            "kind:N",
-            title="Node type",
-            scale=alt.Scale(domain=["Feature", "Account"], range=["diamond", "circle"]),
-            legend=None,
-        ),
-        tooltip=[
-            alt.Tooltip("kind:N", title="Node type"),
-            alt.Tooltip("name:N", title="Feature / account"),
-            alt.Tooltip("id:N", title="Original ID"),
-            alt.Tooltip("pagerank:Q", title="Combined PageRank", format=".6g"),
-            alt.Tooltip("details:N", title="Details"),
-        ],
-    )
-    _labels = (
-        _node_base.transform_filter(
-            "true"
-            if feature_network_account_labels.value
-            else alt.datum.kind == "Feature"
+        return mo.vstack(
+            [
+                topic_widget_grid(
+                    [
+                        mo.stat(f"{_network['features']:,}", label="Top features"),
+                        mo.stat(
+                            f"{_network['accounts']:,}", label="Connected accounts"
+                        ),
+                        mo.stat(
+                            f"{_network['memberships']:,}",
+                            label="Displayed memberships",
+                            caption="Each represents two directed graph edges",
+                        ),
+                        mo.stat(
+                            f"{_network['social_edges']:,}",
+                            label="Displayed following edges",
+                        ),
+                    ]
+                ),
+                mo.ui.altair_chart(
+                    feature_network_chart, chart_selection=False, legend_selection=False
+                ),
+                mo.md(
+                    "**Orange diamonds are features; blue circles are accounts.** Purple lines represent "
+                    "bidirectional account–feature memberships. Gray arrows show following edges from follower "
+                    "to followed account. All memberships between displayed features and accounts are included, "
+                    "even if an account was selected for another feature. Node size uses the same combined "
+                    "PageRank scale for both node types. Hover for full names, IDs, scores, and counts. "
+                    "Scroll to zoom, drag to pan, and double-click to reset. Feature and account IDs occupy "
+                    "separate namespaces. This is a selected view of the graph; hidden accounts and features "
+                    "still contribute to the PageRank scores."
+                ),
+            ]
         )
-        .mark_text(dy=-17, fontSize=10, color="#475569")
-        .encode(x=_x, y=_y, text="label:N")
-    )
-    feature_network_chart = (
-        alt.layer(_links, _arrows, _nodes, _labels)
-        .properties(
-            width="container",
-            height=620,
-            title=f"Top {_network['features']} features and their connected accounts",
-        )
-        .resolve_scale(color="independent")
-        .configure_view(stroke=None)
-        .interactive()
-    )
-    mo.vstack(
-        [
-            topic_widget_grid(
-                [
-                    mo.stat(f"{_network['features']:,}", label="Top features"),
-                    mo.stat(f"{_network['accounts']:,}", label="Connected accounts"),
-                    mo.stat(
-                        f"{_network['memberships']:,}",
-                        label="Displayed memberships",
-                        caption="Each represents two directed graph edges",
-                    ),
-                    mo.stat(
-                        f"{_network['social_edges']:,}",
-                        label="Displayed following edges",
-                    ),
-                ]
-            ),
-            mo.ui.altair_chart(
-                feature_network_chart, chart_selection=False, legend_selection=False
-            ),
-            mo.md(
-                "**Orange diamonds are features; blue circles are accounts.** Purple lines represent "
-                "bidirectional account–feature memberships. Gray arrows show following edges from follower "
-                "to followed account. All memberships between displayed features and accounts are included, "
-                "even if an account was selected for another feature. Node size uses the same combined "
-                "PageRank scale for both node types. Hover for full names, IDs, scores, and counts. "
-                "Scroll to zoom, drag to pan, and double-click to reset. Feature and account IDs occupy "
-                "separate namespaces. This is a selected view of the graph; hidden accounts and features "
-                "still contribute to the PageRank scores."
-            ),
-        ]
-    )
-    return
+
+    feature_network_view = _build_panel()
+    return (feature_network_view,)
 
 
 @app.cell(hide_code=True)
@@ -3373,20 +3839,6 @@ def control_combined_account_ranking():
         value=20,
         full_width=True,
         label="Top accounts from the combined graph",
-    )
-    mo.vstack(
-        [
-            mo.md("### Account PageRank after including features"),
-            topic_widget_grid([combined_account_top_count]),
-            mo.md(
-                "These account scores come from the same full account-and-feature graph used above. "
-                "The following-edge walk share above controls both account and feature rankings. "
-                "Account share is the account's raw combined PageRank divided by the total mass on "
-                "account nodes. This normalization leaves account ordering unchanged and makes shares "
-                "comparable with the account-only model. A higher score is importance under this "
-                "random walk, not a causal effect of having features."
-            ),
-        ]
     )
     return (combined_account_top_count,)
 
@@ -3502,7 +3954,7 @@ def display_combined_account_ranking(
         .properties(
             title="Top accounts in account-and-feature graph",
             width="container",
-            height=max(300, _top.height * 22),
+            height=min(600, max(300, _top.height * 22)),
         )
     )
     _stride = max(1, int(np.ceil(combined_account_ranking.height / 2500)))
@@ -3587,12 +4039,12 @@ def display_combined_account_ranking(
         (_equality + _scatter)
         .properties(
             width="container",
-            height=max(300, _top.height * 22),
+            height=min(600, max(300, _top.height * 22)),
             title="Account rank changes after including features",
         )
         .interactive()
     )
-    mo.vstack(
+    combined_account_ranking_view = mo.vstack(
         [
             topic_widget_grid(
                 [
@@ -3639,28 +4091,32 @@ def display_combined_account_ranking(
                 align="start",
                 gap=1.5,
             ),
-            mo.md(
-                f"The rank comparison shows **{_sample.height:,} accounts**, using a deterministic sample plus the top accounts from both models. "
-                "Lower rank numbers are better. Points above the dashed equality line have improved ranks in the combined model. "
-                "The correlation and ranking table use all accounts. Positive rank gain means an improved rank. "
-                "Both models retain accounts without recorded features; adding features can change their scores too. "
-                "Ranking ties use average ranks, with account IDs ordering the displayed rows."
+            mo.accordion(
+                {
+                    "Interpretation and scope": mo.md(
+                        f"The rank comparison shows **{_sample.height:,} accounts**, using a deterministic sample plus the top accounts from both models. Lower rank numbers are better. Points above the dashed equality line have improved ranks in the combined model. The correlation and ranking table use all accounts. Positive rank gain means an improved rank. Both models retain accounts without recorded features; adding features can change their scores too. Ranking ties use average ranks, with account IDs ordering the displayed rows."
+                    )
+                }
             ),
-            mo.ui.table(
-                _top.drop("account"),
-                selection=None,
-                pagination=True,
-                page_size=10,
-                show_data_types=False,
-                show_column_summaries=False,
-                format_mapping={
-                    "combined_pagerank": "{:.6g}",
-                    "account_share": "{:.4%}",
-                    "account_only_pagerank": "{:.6g}",
-                    "rank_gain": "{:+,.1f}",
-                    "combined_rank": "{:,.1f}",
-                    "account_only_rank": "{:,.1f}",
-                },
+            mo.accordion(
+                {
+                    "Ranking table": mo.ui.table(
+                        _top.drop("account"),
+                        selection=None,
+                        pagination=True,
+                        page_size=10,
+                        show_data_types=False,
+                        show_column_summaries=False,
+                        format_mapping={
+                            "combined_pagerank": "{:.6g}",
+                            "account_share": "{:.4%}",
+                            "account_only_pagerank": "{:.6g}",
+                            "rank_gain": "{:+,.1f}",
+                            "combined_rank": "{:,.1f}",
+                            "account_only_rank": "{:,.1f}",
+                        },
+                    )
+                }
             ),
             mo.accordion(
                 {
@@ -3681,12 +4137,12 @@ def display_combined_account_ranking(
             ),
         ]
     )
-    return
+    return (combined_account_ranking_view,)
 
 
 @app.cell(hide_code=True)
 def describe_ranked_profile_clustering():
-    mo.md(r"""
+    clustering_method_notes = mo.md(r"""
     ## 5. Cluster top-ranked accounts and features
 
     **Do highly ranked accounts share annotations? Do highly ranked features reach
@@ -3709,7 +4165,7 @@ def describe_ranked_profile_clustering():
     Missing annotations remain unobserved data. These are annotation-similarity
     groups within a rank-selected sample, not detected communities of following edges.
     """)
-    return
+    return (clustering_method_notes,)
 
 
 @app.cell(hide_code=True)
@@ -3760,26 +4216,6 @@ def control_ranked_profile_clustering():
         value=4,
         label="DBSCAN: minimum neighbors (includes self)",
         full_width=True,
-    )
-    mo.vstack(
-        [
-            topic_widget_grid(
-                [
-                    ranked_cluster_top_count,
-                    ranked_cluster_account_ranking,
-                    ranked_cluster_k,
-                    ranked_cluster_account_eps,
-                    ranked_cluster_feature_eps,
-                    ranked_cluster_min_samples,
-                ]
-            ),
-            mo.md(
-                "Features use combined-network PageRank and the minimum-account filter above; "
-                "accounts use the selected ranking. Equal scores are ordered by numeric ID. "
-                "Candidate limits are independent of the ranking display limits above. "
-                "K-means uses seed 42 and 10 initializations. Cluster numbers are local to each fit."
-            ),
-        ]
     )
     return (
         ranked_cluster_account_eps,
@@ -4073,7 +4509,7 @@ def compute_ranked_profile_clustering(
 
 @app.cell(hide_code=True)
 def display_ranked_cluster_diagnostics(ranked_cluster_diagnostics):
-    mo.vstack(
+    cluster_diagnostics_view = mo.vstack(
         [
             mo.md("### Coverage and separation"),
             mo.ui.table(
@@ -4094,7 +4530,7 @@ def display_ranked_cluster_diagnostics(ranked_cluster_diagnostics):
             ),
         ]
     )
-    return
+    return (cluster_diagnostics_view,)
 
 
 @app.function(hide_code=True)
@@ -4245,38 +4681,53 @@ def display_ranked_cluster_population(
         [
             mo.hstack(charts, widths="equal", align="start", gap=1.5),
             mo.md(
-                "Both plots share one 2D SVD projection, fitted only for display; "
-                "clustering and silhouette use the full profiles. "
-                "Apparent overlap in 2D can hide separation in other dimensions. "
-                "Cluster numbers do not establish correspondence between algorithms. "
-                "Hover for members, scroll to zoom, and drag to pan."
-            ),
-            neighbor_view,
-            mo.md(
-                "The dashed line is ε. Profiles at or below it have enough neighbors "
-                "to be DBSCAN core points; other profiles may join as border points or remain noise. "
-                "A sharp change near √2 signals weak overlap and sensitivity to radius."
-            ),
-            mo.md("#### Group summaries"),
-            mo.ui.table(
-                group_table,
-                selection=None,
-                pagination=True,
-                page_size=10,
-                show_data_types=False,
-                show_column_summaries=False,
-            ),
-            mo.md(
-                "Groups list their five highest-ranked members. Common memberships show up to "
-                "five features (for account clusters) or accounts (for feature clusters), "
-                "ordered by within-group prevalence; percentages are the share of group members "
-                "with that membership. These are descriptive overlaps, not enrichment scores."
+                "Both algorithms use the same SVD projection for display; clustering uses full profiles. Cluster IDs do not match across algorithms."
             ),
             mo.accordion(
                 {
-                    "Browse every assignment (including noise and unclusterable accounts)": mo.ui.tabs(
-                        member_tables
-                    )
+                    "DBSCAN tuning": mo.vstack(
+                        [
+                            neighbor_view,
+                            mo.md(
+                                "The dashed line is ε. Profiles at or below it have enough neighbors "
+                                "to be DBSCAN core points; other profiles may join as border points or remain noise. "
+                                "A sharp change near √2 signals weak overlap and sensitivity to radius."
+                            ),
+                        ]
+                    ),
+                    "Group summaries": mo.vstack(
+                        [
+                            mo.ui.table(
+                                group_table,
+                                selection=None,
+                                pagination=True,
+                                page_size=10,
+                                show_data_types=False,
+                                show_column_summaries=False,
+                            ),
+                            mo.md(
+                                "Groups list their five highest-ranked members. Common memberships show up to "
+                                "five features (for account clusters) or accounts (for feature clusters), "
+                                "ordered by within-group prevalence; percentages are the share of group members "
+                                "with that membership. These are descriptive overlaps, not enrichment scores."
+                            ),
+                        ]
+                    ),
+                    "All assignments, including noise and unclusterable accounts": mo.vstack(
+                        [
+                            mo.md("#### K-means assignments"),
+                            member_tables["K-means"],
+                            mo.md("#### DBSCAN assignments"),
+                            member_tables["DBSCAN"],
+                        ]
+                    ),
+                    "Projection and interpretation": mo.md(
+                        "Both plots share one 2D SVD projection, fitted only for display; "
+                        "clustering and silhouette use the full profiles. "
+                        "Apparent overlap in 2D can hide separation in other dimensions. "
+                        "Cluster numbers do not establish correspondence between algorithms. "
+                        "Hover for members, scroll to zoom, and drag to pan."
+                    ),
                 }
             ),
         ]
@@ -4291,26 +4742,24 @@ def display_ranked_profile_clustering(
     ranked_cluster_profiles,
     ranked_cluster_results,
 ):
-    mo.ui.tabs(
-        {
-            _population: display_ranked_cluster_population(
-                _population,
-                ranked_cluster_profiles[_population],
-                _result,
-                ranked_cluster_account_eps.value
-                if _population == "Accounts"
-                else ranked_cluster_feature_eps.value,
-                ranked_cluster_min_samples.value,
-            )
-            for _population, _result in ranked_cluster_results.items()
-        }
-    )
-    return
+    ranked_cluster_population_views = {
+        _population: display_ranked_cluster_population(
+            _population,
+            ranked_cluster_profiles[_population],
+            _result,
+            ranked_cluster_account_eps.value
+            if _population == "Accounts"
+            else ranked_cluster_feature_eps.value,
+            ranked_cluster_min_samples.value,
+        )
+        for _population, _result in ranked_cluster_results.items()
+    }
+    return (ranked_cluster_population_views,)
 
 
 @app.cell(hide_code=True)
 def describe_ego_network_selection():
-    mo.md(r"""
+    ego_network_notes = mo.md(r"""
     ## Select Node to Analyze
 
     Choose an ego node to construct a reactive egocentric network. Changing the
@@ -4322,7 +4771,7 @@ def describe_ego_network_selection():
     The resulting table retains each node's global relationship lists and adds
     `alter_*` columns restricted to members of this selected network.
     """)
-    return
+    return (ego_network_notes,)
 
 
 @app.cell(hide_code=True)
@@ -4342,37 +4791,7 @@ def select_ego_node(nodes_lf):
 
 
 @app.cell(hide_code=True)
-def control_ego_network_visualization(
-    ego_network_feature,
-    ego_network_labels,
-    ego_network_neighbor_edges,
-    ego_network_node_limit,
-    ego_network_relationship,
-    ego_node_dropdown,
-):
-    mo.vstack(
-        [
-            mo.md("### Network controls"),
-            mo.md("#### Nodes and filters"),
-            topic_widget_grid(
-                [
-                    ego_node_dropdown,
-                    ego_network_relationship,
-                    ego_network_feature,
-                    ego_network_node_limit,
-                ]
-            ),
-            mo.md("#### Display options"),
-            topic_widget_grid([ego_network_neighbor_edges, ego_network_labels]),
-            mo.md(
-                "Features are sorted by neighbor count, highest first. Search features recorded "
-                "among this ego's incoming or outgoing neighbors. The ego remains visible even "
-                "if it does not have the chosen feature. Nodes without recorded features match "
-                "only **All features**."
-            ),
-        ],
-        gap=1,
-    )
+def control_ego_network_visualization():
     return
 
 
@@ -4412,9 +4831,7 @@ def build_egocentric_network(ego_node_dropdown, nodes_lf):
             ],
         )
     )
-
-    mo.ui.table(egocentric_network_lf, selection=None)
-    return (ego_node,)
+    return ego_node, egocentric_network_lf
 
 
 @app.cell(hide_code=True)
@@ -4773,7 +5190,7 @@ def display_ego_network_visualization(
         alt.layer(_edges, _arrows, _nodes, _labels)
         .properties(
             width="container",
-            height=520,
+            height=480,
             title=f"Node {ego_node}: {ego_network_relationship.value}",
         )
         .configure_view(stroke=None)
@@ -4785,11 +5202,10 @@ def display_ego_network_visualization(
         if ego_network_neighbor_edges.value
         else "Only connections involving the ego are shown."
     )
-    mo.vstack(
+    ego_network_view = mo.vstack(
         [
             mo.md(
-                f"**{ego_network_relationship.value}** · **{_shown:,} of {_plot['total_nodes']:,} nodes** · "
-                f"**{_plot['directed_edges']:,} displayed directed edges**. "
+                f"**{ego_network_relationship.value}** · **{_shown:,} of {_plot['total_nodes']:,} nodes** · **{_plot['directed_edges']:,} displayed directed edges**. "
                 + (
                     "The ego is always retained; remaining nodes are ranked by incoming + outgoing degree within the full ego network. "
                     if _shown < _plot["total_nodes"]
@@ -4814,20 +5230,16 @@ def display_ego_network_visualization(
             mo.ui.altair_chart(
                 ego_network_chart, chart_selection=False, legend_selection=False
             ),
-            mo.md(
-                "Hover for node IDs and connection counts; scroll to zoom, drag to pan, and double-click to reset. "
-                "Arrows point from follower to followed account. Teal edges are mutual; gray edges are one-way. "
-                "Larger neighbors have more displayed connections. Positions show network structure, not geography. "
-                "The relationship selector chooses neighbors relative to the ego: following shows outgoing ego arrows, "
-                "followers shows incoming ego arrows, friends retains both directions for mutual neighbors, "
-                "and all includes both sets of neighbors and directions. Connections between neighbors, when enabled, "
-                "retain their observed directions. Node colors describe the original relationship to the ego, "
-                "even when one arrow direction is hidden. Counts refer to the full selected network before the display limit. "
-                "Self-loops are omitted."
+            mo.accordion(
+                {
+                    "Interpretation and scope": mo.md(
+                        "Hover for node IDs and connection counts; scroll to zoom, drag to pan, and double-click to reset. Arrows point from follower to followed account. Teal edges are mutual; gray edges are one-way. Larger neighbors have more displayed connections. Positions show network structure, not geography. The relationship selector chooses neighbors relative to the ego: following shows outgoing ego arrows, followers shows incoming ego arrows, friends retains both directions for mutual neighbors, and all includes both sets of neighbors and directions. Connections between neighbors, when enabled, retain their observed directions. Node colors describe the original relationship to the ego, even when one arrow direction is hidden. Counts refer to the full selected network before the display limit. Self-loops are omitted."
+                    )
+                }
             ),
         ]
     )
-    return
+    return (ego_network_view,)
 
 
 @app.cell
