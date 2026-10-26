@@ -14,6 +14,12 @@ with app.setup:
     import numpy as np
     import altair as alt
     import networkx as nx
+    from sklearn.cluster import DBSCAN, KMeans
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.metrics import pairwise_distances, silhouette_score
+    from sklearn.preprocessing import normalize
+    from threadpoolctl import threadpool_limits
+    from hashlib import sha256
 
 
 @app.cell(hide_code=True)
@@ -87,8 +93,13 @@ def describe_ego_features():
     - `.circles` and `.edges` are discovered for possible later analysis but are
       not transformed in this section.
 
-    Features are identified globally by name. Local ego/index pairs are retained
-    only as provenance so each source vector can be mapped to global feature IDs.
+    Names are lowercased as soon as they are extracted, then every character other
+    than a Unicode letter or number is removed. For example, `#NASA`, `@NASA:` and
+    `#nasa` all become `nasa`. Names that become empty are discarded.
+
+    Features with the same normalized name share one global code. Local ego/index
+    pairs are retained as provenance so all original positions decode to that code.
+    Membership is the union of matching positions and observations.
     """)
     return
 
@@ -108,17 +119,53 @@ def discover_ego_network_files(DATA_PATH):
 
 
 @app.cell(hide_code=True)
-def load_feature_catalog(FEATNAMES_FILES, PARQUET_OUT_PATH):
-    # Read either the global feature catalog or a legacy ego/index name map.
-    # The save cell upgrades legacy metadata to the global catalog format.
-    _cache_path = PARQUET_OUT_PATH / "feature_names.parquet"
-    if _cache_path.is_file():
-        loaded_feats_lf = pl.scan_parquet(_cache_path)
-    else:
-        if not FEATNAMES_FILES:
-            raise FileNotFoundError(
-                "No .featnames files found and no feature-name cache exists"
+def define_feature_name_normalization():
+    def normalize_feature_name(expression):
+        """Lowercase names and retain only Unicode letters and numbers."""
+        return expression.str.to_lowercase().str.replace_all(r"[^\p{L}\p{N}]", "")
+
+    def build_global_feature_catalog(origins):
+        """Assign one deterministic code per nonempty normalized name."""
+        if origins.select(pl.any_horizontal(pl.all().is_null()).any()).collect().item():
+            raise ValueError("Feature names and source ego/index pairs cannot be null")
+        if (
+            origins.group_by("ego_node", "index")
+            .agg(pl.col("name").n_unique().alias("names"))
+            .filter(pl.col("names") > 1)
+            .select(pl.len())
+            .collect()
+            .item()
+        ):
+            raise ValueError(
+                "Each source ego/index pair must identify one normalized name"
             )
+        return (
+            origins.filter(pl.col("name") != "")
+            .unique()
+            .sort(["name", "ego_node", "index"])
+            .group_by("name", maintain_order=True)
+            .agg(pl.struct("ego_node", "index").alias("sources"))
+            .sort("name")
+            .with_row_index("id")
+            .with_columns(pl.col("id").cast(pl.Int64))
+            .select("id", "name", "sources")
+            .collect()
+        )
+
+    return build_global_feature_catalog, normalize_feature_name
+
+
+@app.cell(hide_code=True)
+def load_feature_catalog(
+    FEATNAMES_FILES,
+    PARQUET_OUT_PATH,
+    normalize_feature_name,
+):
+    # Normalize names at extraction, before grouping or assigning global codes.
+    # Reading the small name files also retains source positions whose names
+    # become empty, so those positions can be deliberately ignored during decoding.
+    _cache_path = PARQUET_OUT_PATH / "feature_names.parquet"
+    if FEATNAMES_FILES:
         _regex = r"^\s*(\d+)\s+(.+?)\s*$"
         _featnames_items = [
             pl.DataFrame(
@@ -136,12 +183,28 @@ def load_feature_catalog(FEATNAMES_FILES, PARQUET_OUT_PATH):
                 .str.extract(_regex, group_index=1)
                 .cast(pl.Int64)
                 .alias("index"),
-                pl.col("raw_line").str.extract(_regex, group_index=2).alias("name"),
+                normalize_feature_name(
+                    pl.col("raw_line").str.extract(_regex, group_index=2)
+                ).alias("name"),
             )
             for _file in FEATNAMES_FILES
         ]
         loaded_feats_lf = pl.concat(_featnames_items, how="vertical").sort(
             ["ego_node", "index"]
+        )
+    elif _cache_path.is_file():
+        # A cached catalog can still support analysis without the source name files.
+        _cached_catalog = pl.scan_parquet(_cache_path)
+        loaded_feats_lf = (
+            _cached_catalog.select("name", "sources")
+            .explode("sources")
+            .unnest("sources")
+            if "sources" in _cached_catalog.collect_schema()
+            else _cached_catalog.select("name", "ego_node", "index")
+        ).with_columns(normalize_feature_name(pl.col("name")).alias("name"))
+    else:
+        raise FileNotFoundError(
+            "No .featnames files found and no feature-name cache exists"
         )
     return (loaded_feats_lf,)
 
@@ -152,17 +215,22 @@ def load_node_feature_vectors(
     FEAT_FILES,
     PARQUET_OUT_PATH,
     TWITTER_EGO_FILES_PATH,
+    feature_cache_metadata,
 ):
     # Source vectors are temporary inputs. The persistent node cache stores
     # global feature-ID lists instead of separate ego-specific binary vectors.
     _cache_path = PARQUET_OUT_PATH / "nodes.parquet"
-    _catalog_path = PARQUET_OUT_PATH / "feature_names.parquet"
+    _node_metadata = (
+        pl.read_parquet_metadata(_cache_path) if _cache_path.is_file() else {}
+    )
     if (
         _cache_path.is_file()
-        and _catalog_path.is_file()
         and pl.scan_parquet(_cache_path).collect_schema().get("features")
         == pl.List(pl.Int64)
-        and "sources" in pl.scan_parquet(_catalog_path).collect_schema()
+        and all(
+            _node_metadata.get(_key) == _value
+            for _key, _value in feature_cache_metadata.items()
+        )
     ):
         loaded_node_feature_vectors_lf = None
     else:
@@ -220,14 +288,15 @@ def describe_parquet_caching():
 
     This section converts the normalized lazy datasets into reusable Parquet
     caches under **`data/out`**. Missing caches are written with Zstandard
-    compression; existing files are reused unless their schema needs an upgrade.
+    compression; existing feature and node files are reused only when their normalization
+    version and feature-codebook digest match.
     Downstream cells receive a lazy scan of the Parquet file, so the application
     benefits from predicate and column pushdown.
 
     Cached datasets:
 
     - `edges.parquet`: deduplicated and sorted directed edges
-    - `feature_names.parquet`: one row per distinct feature name, with a unique
+    - `feature_names.parquet`: one row per distinct nonempty normalized feature name, with a unique
       integer `id` and `sources`, a list of `{ego_node, index}` structs. IDs start
       at 0 in alphabetical name order.
     - `nodes.parquet`: relationship lists and a sorted `features` list of global
@@ -235,12 +304,15 @@ def describe_parquet_caching():
       included if it is active in any source network, including ego records.
       Nodes without observed active features have an empty list.
 
-    Source binary vectors are read only when building or upgrading the node
-    cache; a separate vector cache is no longer used.
+    Source name files are normalized before building the codebook. Source binary
+    vectors are read only when building or upgrading the node cache; a separate
+    vector cache is no longer used. Feature and node Parquet metadata record the
+    same normalization version and codebook digest. Old caches rebuild automatically,
+    including after an interrupted rebuild, so node codes stay aligned.
 
-    > To rebuild after changing source files or preprocessing logic, delete the
-    > affected file from `data/out` and rerun the loading section. When rebuilding
-    > the feature catalog, also delete `nodes.parquet` so its IDs stay aligned.
+    > Changes to source names update the codebook and rebuild dependent node codes
+    > automatically. After changing binary vector or edge files, delete the affected
+    > node or edge cache in `data/out` and rerun the loading section.
     """)
     return
 
@@ -249,31 +321,50 @@ def describe_parquet_caching():
 def cache_lazyframe_to_parquet(
     frame: pl.LazyFrame,
     path: Path,
+    *,
+    metadata: dict[str, str] | None = None,
 ) -> tuple[pl.LazyFrame, dict]:
-    """Cache a LazyFrame atomically and return its lazy scan plus a report.
+    """Atomically create or refresh a cache whose requested metadata has changed.
 
-    A new dataset is first written inside a temporary directory, validated by
-    comparing schemas, and then moved into its final path. This prevents an
-    interrupted write from leaving a partial cache. Existing caches are left
-    untouched.
+    Feature and node caches share a normalization version and codebook digest.
+    If rebuilding stops between the two files, their mismatched metadata forces
+    node features to be decoded again rather than reusing incompatible codes.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    created = not path.is_file()
-    if created:
+    existed = path.is_file()
+    needs_write = not existed
+    if existed and metadata is not None:
+        cached_metadata = pl.read_parquet_metadata(path)
+        needs_write = any(
+            cached_metadata.get(key) != value for key, value in metadata.items()
+        )
+    if needs_write:
         with TemporaryDirectory(prefix=".parquet-", dir=path.parent) as temp_dir:
             temporary_path = Path(temp_dir) / path.name
-            frame.sink_parquet(temporary_path, compression="zstd")
+            frame.sink_parquet(
+                temporary_path, compression="zstd", metadata=metadata
+            )
             if (
                 pl.scan_parquet(temporary_path).collect_schema()
                 != frame.collect_schema()
             ):
                 raise ValueError(f"Parquet schema mismatch for {path.name}")
+            if metadata is not None:
+                written_metadata = pl.read_parquet_metadata(temporary_path)
+                if any(
+                    written_metadata.get(key) != value
+                    for key, value in metadata.items()
+                ):
+                    raise ValueError(f"Parquet metadata mismatch for {path.name}")
             temporary_path.replace(path)
-
     cached_frame = pl.scan_parquet(path)
     report = {
         "file": path.name,
-        "status": "Created" if created else "Reused",
+        "status": "Rebuilt"
+        if needs_write and existed
+        else "Created"
+        if needs_write
+        else "Reused",
         "rows": cached_frame.select(pl.len()).collect().item(),
         "size_mib": round(path.stat().st_size / (1024**2), 2),
     }
@@ -283,65 +374,32 @@ def cache_lazyframe_to_parquet(
 @app.cell(hide_code=True)
 def cache_edges_and_feature_catalog(
     PARQUET_OUT_PATH,
+    build_global_feature_catalog,
     loaded_edges_lf,
     loaded_feats_lf,
 ):
-    # Materialize each missing cache, then expose only Parquet-backed LazyFrames to
-    # the rest of the notebook. The report makes cache state, row count, and disk
-    # usage visible without collecting the full datasets into Python memory.
     edges_lf, _edges_cache_report = cache_lazyframe_to_parquet(
-        loaded_edges_lf,
-        PARQUET_OUT_PATH / "edges.parquet",
+        loaded_edges_lf, PARQUET_OUT_PATH / "edges.parquet"
     )
-    _features_path = PARQUET_OUT_PATH / "feature_names.parquet"
-    _features_schema = loaded_feats_lf.collect_schema()
-    _features_need_upgrade = "sources" not in _features_schema
-    if _features_need_upgrade:
-        _feature_origins = loaded_feats_lf.select("name", "ego_node", "index")
-        if (
-            _feature_origins.select(pl.any_horizontal(pl.all().is_null()).any())
-            .collect()
-            .item()
-        ):
-            raise ValueError("Feature names and source ego/index pairs cannot be null")
-        if (
-            _feature_origins.group_by("ego_node", "index")
-            .agg(pl.col("name").n_unique().alias("names"))
-            .filter(pl.col("names") > 1)
-            .select(pl.len())
-            .collect()
-            .item()
-        ):
-            raise ValueError(
-                "Each source ego/index pair must identify one feature name"
-            )
-        _features_to_cache = (
-            _feature_origins.unique()
-            .sort(["name", "ego_node", "index"])
-            .group_by("name", maintain_order=True)
-            .agg(pl.struct("ego_node", "index").alias("sources"))
-            .sort("name")
-            .with_row_index("id")
-            .with_columns(pl.col("id").cast(pl.Int64))
-            .select("id", "name", "sources")
-        )
-    else:
-        _features_to_cache = loaded_feats_lf
-    if _features_need_upgrade and _features_path.is_file():
-        # Replace the old cache only after its upgraded copy is complete.
-        with TemporaryDirectory(
-            prefix=".parquet-", dir=_features_path.parent
-        ) as _features_temp_dir:
-            _features_temp_path = Path(_features_temp_dir) / _features_path.name
-            cache_lazyframe_to_parquet(_features_to_cache, _features_temp_path)
-            _features_temp_path.replace(_features_path)
+    _normalized_catalog = build_global_feature_catalog(
+        loaded_feats_lf.select("name", "ego_node", "index")
+    )
+    # Include both names/codes and source positions in the cache identity.
+    # JSON serialization is deterministic because every level was sorted above.
+    feature_cache_metadata = {
+        "feature_normalization": "unicode-alnum-lower-v1",
+        "feature_codebook_sha256": sha256(
+            _normalized_catalog.write_json().encode("utf-8")
+        ).hexdigest(),
+    }
     feats_lf, _feats_cache_report = cache_lazyframe_to_parquet(
-        _features_to_cache,
-        _features_path,
+        _normalized_catalog.lazy(),
+        PARQUET_OUT_PATH / "feature_names.parquet",
+        metadata=feature_cache_metadata,
     )
     parquet_cache_report = pl.DataFrame([_edges_cache_report, _feats_cache_report])
     mo.ui.table(parquet_cache_report, selection=None)
-    return edges_lf, feats_lf
+    return edges_lf, feats_lf, feature_cache_metadata
 
 
 @app.cell(hide_code=True)
@@ -349,9 +407,10 @@ def describe_consolidated_features():
     mo.md(r"""
     ### Consolidated Feature View
 
-    `feats_lf` is the unique global feature catalog. Its `sources` list records
+    `feats_lf` is the unique global catalog of lowercase, alphanumeric names. Its `sources` list records
     the local indices used to decode source vectors. `node_feature_lists_lf`
-    merges active features across every observation of a node, keeping one sorted
+    merges matching source names and active features across every observation of a
+    node, keeping one sorted
     list of unique feature IDs per node. A zero in one observation does not remove
     a feature observed as active elsewhere. Nodes with no active features remain
     present with an empty list.
@@ -366,6 +425,7 @@ def describe_consolidated_features():
 def consolidate_node_features(
     PARQUET_OUT_PATH,
     feats_lf,
+    loaded_feats_lf,
     loaded_node_feature_vectors_lf,
 ):
     if loaded_node_feature_vectors_lf is None:
@@ -373,10 +433,13 @@ def consolidate_node_features(
             PARQUET_OUT_PATH / "nodes.parquet"
         ).select("node", "features")
     else:
+        # Multiple local positions may map to the same normalized global code.
+        # Keep empty names in this lookup to distinguish deliberately discarded
+        # annotations from source positions that are actually missing or malformed.
         _feature_lookup = (
-            feats_lf.select("id", "sources")
-            .explode("sources")
-            .unnest("sources")
+            loaded_feats_lf.select("ego_node", "index", "name")
+            .unique()
+            .join(feats_lf.select("id", "name"), on="name", how="left", validate="m:1")
             .rename({"id": "feature_id"})
         )
         _active_features = (
@@ -391,22 +454,29 @@ def consolidate_node_features(
             .explode("index")
             .filter(pl.col("index").is_not_null())
             .join(_feature_lookup, on=["ego_node", "index"], how="left", validate="m:1")
+            .collect()
+            .lazy()
         )
         if (
-            _active_features.select(pl.col("feature_id").is_null().any())
+            _active_features.select(
+                (
+                    pl.col("name").is_null()
+                    | ((pl.col("name") != "") & pl.col("feature_id").is_null())
+                ).any()
+            )
             .collect()
             .item()
         ):
             raise ValueError(
-                "An active source feature is missing from the feature catalog"
+                "An active source feature is missing from the normalized catalog"
             )
         node_feature_lists_lf = (
             loaded_node_feature_vectors_lf.select("node")
             .unique()
             .join(
-                _active_features.group_by("node").agg(
-                    pl.col("feature_id").unique().sort().alias("features")
-                ),
+                _active_features.filter(pl.col("name") != "")
+                .group_by("node")
+                .agg(pl.col("feature_id").unique().sort().alias("features")),
                 on="node",
                 how="left",
             )
@@ -444,6 +514,7 @@ def describe_node_relationships():
 def consolidate_and_cache_nodes(
     PARQUET_OUT_PATH,
     edges_lf,
+    feature_cache_metadata,
     loaded_node_feature_vectors_lf,
     node_feature_lists_lf,
 ):
@@ -510,15 +581,8 @@ def consolidate_and_cache_nodes(
             )
             .sort("node")
         )
-        if _nodes_path.is_file():
-            with TemporaryDirectory(
-                prefix=".parquet-", dir=_nodes_path.parent
-            ) as _nodes_temp_dir:
-                _nodes_temp_path = Path(_nodes_temp_dir) / _nodes_path.name
-                cache_lazyframe_to_parquet(_nodes_to_cache, _nodes_temp_path)
-                _nodes_temp_path.replace(_nodes_path)
         nodes_lf, _nodes_cache_report = cache_lazyframe_to_parquet(
-            _nodes_to_cache, _nodes_path
+            _nodes_to_cache, _nodes_path, metadata=feature_cache_metadata
         )
     # The consolidated node cache now contains all persisted feature lists.
     (PARQUET_OUT_PATH / "node_feature_vectors.parquet").unlink(missing_ok=True)
@@ -3616,6 +3680,630 @@ def display_combined_account_ranking(
                 }
             ),
         ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def describe_ranked_profile_clustering():
+    mo.md(r"""
+    ## 5. Cluster top-ranked accounts and features
+
+    **Do highly ranked accounts share annotations? Do highly ranked features reach
+    the same accounts?** Compare K-means and DBSCAN separately for each population.
+    PageRank selects the candidates; scores and ranks are not clustering inputs.
+
+    - **Accounts:** binary profiles over every recorded feature.
+    - **Features:** binary profiles over every account in the dataset, including
+      accounts outside the top-ranked selection.
+
+    Profiles are L2-normalized so overlap matters more than profile size. K-means
+    minimizes squared Euclidean distance to centroids and assigns every usable profile;
+    DBSCAN groups densely connected profiles within radius ε and can label others
+    as noise. The same normalized profiles are used for both algorithms. On these
+    profiles, Euclidean distance is √(2 × cosine distance); disjoint profiles are
+    √2 ≈ 1.414 apart. Sparse annotations can therefore make DBSCAN highly sensitive
+    to ε near that value.
+
+    Accounts without recorded annotations are **unclusterable**, rather than noise.
+    Missing annotations remain unobserved data. These are annotation-similarity
+    groups within a rank-selected sample, not detected communities of following edges.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def control_ranked_profile_clustering():
+    ranked_cluster_top_count = mo.ui.slider(
+        start=20,
+        stop=500,
+        step=20,
+        value=200,
+        label="Top candidates per population",
+        full_width=True,
+    )
+    ranked_cluster_account_ranking = mo.ui.dropdown(
+        options=["Combined PageRank", "Account-only PageRank"],
+        value="Combined PageRank",
+        allow_select_none=False,
+        label="Account candidate ranking",
+        full_width=True,
+    )
+    ranked_cluster_k = mo.ui.slider(
+        start=2,
+        stop=15,
+        value=6,
+        step=1,
+        label="K-means: requested clusters (k)",
+        full_width=True,
+    )
+    ranked_cluster_account_eps = mo.ui.slider(
+        start=0.05,
+        stop=1.45,
+        step=0.01,
+        value=1.38,
+        label="Account DBSCAN: radius ε",
+        full_width=True,
+    )
+    ranked_cluster_feature_eps = mo.ui.slider(
+        start=0.05,
+        stop=1.45,
+        step=0.01,
+        value=1.30,
+        label="Feature DBSCAN: radius ε",
+        full_width=True,
+    )
+    ranked_cluster_min_samples = mo.ui.slider(
+        start=2,
+        stop=20,
+        step=1,
+        value=4,
+        label="DBSCAN: minimum neighbors (includes self)",
+        full_width=True,
+    )
+    mo.vstack(
+        [
+            topic_widget_grid(
+                [
+                    ranked_cluster_top_count,
+                    ranked_cluster_account_ranking,
+                    ranked_cluster_k,
+                    ranked_cluster_account_eps,
+                    ranked_cluster_feature_eps,
+                    ranked_cluster_min_samples,
+                ]
+            ),
+            mo.md(
+                "Features use combined-network PageRank and the minimum-account filter above; "
+                "accounts use the selected ranking. Equal scores are ordered by numeric ID. "
+                "Candidate limits are independent of the ranking display limits above. "
+                "K-means uses seed 42 and 10 initializations. Cluster numbers are local to each fit."
+            ),
+        ]
+    )
+    return (
+        ranked_cluster_account_eps,
+        ranked_cluster_account_ranking,
+        ranked_cluster_feature_eps,
+        ranked_cluster_k,
+        ranked_cluster_min_samples,
+        ranked_cluster_top_count,
+    )
+
+
+@app.cell(hide_code=True)
+def define_ranked_cluster_profiles(sparse):
+    def prepare_ranked_cluster_profiles(metadata, incidence):
+        """Retain rank order, exclude empty profiles, and prepare a bounded comparison."""
+        binary = sparse.csr_matrix(incidence, dtype=np.float64)
+        binary.eliminate_zeros()
+        binary.sort_indices()
+        if binary.shape[0] != metadata.height:
+            raise ValueError("Profile rows must match the ranked candidate table")
+        if binary.nnz and (
+            not np.isfinite(binary.data).all() or np.any(binary.data != 1)
+        ):
+            raise ValueError("Clustering requires finite binary memberships")
+        observed = np.diff(binary.indptr) > 0
+        active_columns = np.flatnonzero(np.asarray(binary.sum(axis=0)).ravel())
+        usable = binary[observed][:, active_columns]
+        profiles = normalize(usable) if usable.shape[0] else usable
+        # Duplicate binary supports also identify duplicate normalized profiles.
+        unique_count = len(
+            {
+                tuple(usable.indices[usable.indptr[row] : usable.indptr[row + 1]])
+                for row in range(usable.shape[0])
+            }
+        )
+        coordinates = np.zeros((usable.shape[0], 2))
+        if usable.shape[0]:
+            with threadpool_limits(limits=2):
+                distances = pairwise_distances(profiles, metric="euclidean")
+                if unique_count > 1 and min(profiles.shape) > 1:
+                    coordinates = TruncatedSVD(
+                        n_components=2, random_state=42
+                    ).fit_transform(profiles)
+                else:
+                    coordinates[:, 0] = 1.0
+            np.fill_diagonal(distances, 0.0)
+            # sklearn accepts precomputed DBSCAN distances only when nonnegative.
+            distances = np.maximum(distances, 0.0)
+        else:
+            distances = np.empty((0, 0))
+        return {
+            "metadata": metadata,
+            "observed": observed,
+            "binary": usable,
+            "profiles": profiles,
+            "active_columns": active_columns,
+            "distances": distances,
+            "coordinates": coordinates,
+            "unique_count": unique_count,
+        }
+
+    return (prepare_ranked_cluster_profiles,)
+
+
+@app.cell(hide_code=True)
+def prepare_ranked_cluster_populations(
+    combined_account_ranking,
+    feature_account_incidence,
+    feature_network_incidence_columns,
+    feature_pagerank_catalog,
+    feature_pagerank_min_accounts,
+    feature_pagerank_scores,
+    network_node_ids,
+    prepare_ranked_cluster_profiles,
+    ranked_cluster_account_ranking,
+    ranked_cluster_top_count,
+):
+    _account_score = (
+        "combined_pagerank"
+        if ranked_cluster_account_ranking.value == "Combined PageRank"
+        else "account_only_pagerank"
+    )
+    _account_rank = (
+        "combined_rank"
+        if ranked_cluster_account_ranking.value == "Combined PageRank"
+        else "account_only_rank"
+    )
+    _accounts = (
+        combined_account_ranking.sort(
+            [_account_score, "node"], descending=[True, False]
+        )
+        .head(ranked_cluster_top_count.value)
+        .select(
+            pl.col("node").alias("id"),
+            pl.col("node").cast(pl.String).alias("label"),
+            pl.col(_account_rank).alias("rank"),
+            pl.col(_account_score).alias("pagerank"),
+            pl.col("recorded_features").alias("memberships"),
+        )
+    )
+    _features = (
+        feature_pagerank_scores.filter(
+            pl.col("account_count") >= feature_pagerank_min_accounts.value
+        )
+        .sort(["pagerank", "id"], descending=[True, False])
+        .head(ranked_cluster_top_count.value)
+        .select(
+            "id",
+            pl.col("name").alias("label"),
+            pl.col("pagerank_rank").alias("rank"),
+            "pagerank",
+            pl.col("account_count").alias("memberships"),
+        )
+    )
+    _account_positions = np.searchsorted(network_node_ids, _accounts["id"].to_numpy())
+    _feature_positions = np.searchsorted(
+        feature_pagerank_catalog["id"].to_numpy(), _features["id"].to_numpy()
+    )
+    ranked_cluster_profiles = {
+        "Accounts": prepare_ranked_cluster_profiles(
+            _accounts, feature_account_incidence[_account_positions, :]
+        ),
+        "Features": prepare_ranked_cluster_profiles(
+            _features, feature_network_incidence_columns[:, _feature_positions].T
+        ),
+    }
+    return (ranked_cluster_profiles,)
+
+
+@app.function(hide_code=True)
+def fit_ranked_profile_clusters(
+    prepared, requested_k, eps, min_samples, coordinate_labels
+):
+    """Fit in full profile space; return labels, diagnostics, and interpretable groups."""
+    metadata = prepared["metadata"]
+    observed = prepared["observed"]
+    profiles = prepared["profiles"]
+    size = profiles.shape[0]
+    effective_k = min(requested_k, prepared["unique_count"], size)
+    with threadpool_limits(limits=2):
+        kmeans_labels = (
+            KMeans(n_clusters=effective_k, random_state=42, n_init=10).fit_predict(
+                profiles
+            )
+            if size
+            else np.array([], dtype=int)
+        )
+        dbscan_labels = (
+            DBSCAN(
+                eps=eps, min_samples=min_samples, metric="precomputed"
+            ).fit_predict(prepared["distances"])
+            if size
+            else np.array([], dtype=int)
+        )
+    memberships, metrics, groups = [], [], []
+    usable_metadata = metadata.filter(pl.Series(observed))
+    coordinate_names = np.asarray(coordinate_labels)[prepared["active_columns"]]
+    for algorithm, raw_labels in [
+        ("K-means", kmeans_labels),
+        ("DBSCAN", dbscan_labels),
+    ]:
+        # Stable numbering by best-ranked member makes tables easier to scan.
+        label_order = list(
+            dict.fromkeys(int(label) for label in raw_labels if label >= 0)
+        )
+        label_map = {label: index + 1 for index, label in enumerate(label_order)}
+        names = [
+            "Noise" if label < 0 else f"Cluster {label_map[int(label)]}"
+            for label in raw_labels
+        ]
+        all_labels = np.full(metadata.height, "Unclusterable", dtype=object)
+        all_labels[observed] = names
+        x, y = np.full(metadata.height, np.nan), np.full(metadata.height, np.nan)
+        x[observed], y[observed] = prepared["coordinates"].T
+        memberships.append(
+            metadata.with_columns(
+                pl.lit(algorithm).alias("algorithm"),
+                pl.Series("cluster", all_labels, dtype=pl.String),
+                pl.Series("svd_1", x),
+                pl.Series("svd_2", y),
+            )
+        )
+        retained = raw_labels >= 0
+        cluster_count = len(label_order)
+        silhouette = None
+        if 1 < cluster_count < int(retained.sum()):
+            with threadpool_limits(limits=2):
+                silhouette = float(
+                    silhouette_score(
+                        prepared["distances"][np.ix_(retained, retained)],
+                        raw_labels[retained],
+                        metric="precomputed",
+                    )
+                )
+        metrics.append(
+            {
+                "algorithm": algorithm,
+                "selected": metadata.height,
+                "usable": size,
+                "unclusterable": int((~observed).sum()),
+                "clusters": cluster_count,
+                "clustered": int(retained.sum()),
+                "noise": int((~retained).sum()),
+                "coverage": float(retained.mean()) if size else None,
+                "silhouette": silhouette,
+                "settings": (
+                    f"k={effective_k} (requested {requested_k})"
+                    if algorithm == "K-means"
+                    else f"ε={eps:.2f}; min_samples={min_samples}"
+                ),
+            }
+        )
+        for label in [*label_order, *([-1] if np.any(~retained) else [])]:
+            positions = np.flatnonzero(raw_labels == label)
+            member_table = usable_metadata[positions.tolist()]
+            common = ""
+            if label >= 0:
+                frequencies = np.asarray(
+                    prepared["binary"][positions].mean(axis=0)
+                ).ravel()
+                top_coordinates = np.argsort(-frequencies, kind="stable")[:5]
+                common = "; ".join(
+                    f"{coordinate_names[index]} ({frequencies[index]:.0%})"
+                    for index in top_coordinates
+                    if frequencies[index] > 0
+                )
+            groups.append(
+                {
+                    "algorithm": algorithm,
+                    "cluster": "Noise"
+                    if label < 0
+                    else f"Cluster {label_map[label]}",
+                    "members": len(positions),
+                    "highest_ranked_members": "; ".join(
+                        member_table["label"].head(5).to_list()
+                    ),
+                    "common_profile_memberships": common,
+                }
+            )
+    group_schema = {
+        "algorithm": pl.String,
+        "cluster": pl.String,
+        "members": pl.Int64,
+        "highest_ranked_members": pl.String,
+        "common_profile_memberships": pl.String,
+    }
+    return {
+        "members": pl.concat(memberships),
+        "metrics": pl.DataFrame(
+            metrics,
+            schema_overrides={"coverage": pl.Float64, "silhouette": pl.Float64},
+        ),
+        "groups": pl.DataFrame(groups, schema=group_schema),
+    }
+
+
+@app.cell(hide_code=True)
+def compute_ranked_profile_clustering(
+    feature_pagerank_catalog,
+    network_node_ids,
+    ranked_cluster_account_eps,
+    ranked_cluster_feature_eps,
+    ranked_cluster_k,
+    ranked_cluster_min_samples,
+    ranked_cluster_profiles,
+):
+    ranked_cluster_results = {
+        "Accounts": fit_ranked_profile_clusters(
+            ranked_cluster_profiles["Accounts"],
+            ranked_cluster_k.value,
+            ranked_cluster_account_eps.value,
+            ranked_cluster_min_samples.value,
+            feature_pagerank_catalog["name"].to_numpy(),
+        ),
+        "Features": fit_ranked_profile_clusters(
+            ranked_cluster_profiles["Features"],
+            ranked_cluster_k.value,
+            ranked_cluster_feature_eps.value,
+            ranked_cluster_min_samples.value,
+            network_node_ids.astype(str),
+        ),
+    }
+    ranked_cluster_diagnostics = pl.concat(
+        [
+            _result["metrics"].with_columns(pl.lit(_population).alias("population"))
+            for _population, _result in ranked_cluster_results.items()
+        ]
+    ).select("population", pl.exclude("population"))
+    return ranked_cluster_diagnostics, ranked_cluster_results
+
+
+@app.cell(hide_code=True)
+def display_ranked_cluster_diagnostics(ranked_cluster_diagnostics):
+    mo.vstack(
+        [
+            mo.md("### Coverage and separation"),
+            mo.ui.table(
+                ranked_cluster_diagnostics,
+                selection=None,
+                show_data_types=False,
+                show_column_summaries=False,
+                format_mapping={"coverage": "{:.1%}", "silhouette": "{:.3f}"},
+            ),
+            mo.md(
+                "**Coverage** is the fraction of usable profiles assigned to a cluster. "
+                "**Silhouette** uses Euclidean distances in the full normalized profile space; "
+                "higher values indicate better separation. It is undefined without at least two "
+                "clusters and more assigned profiles than clusters. DBSCAN silhouette excludes "
+                "noise, so compare it together with coverage, not as a standalone winner. "
+                "K-means k is capped by the number of distinct usable profiles. "
+                "The controls are exploratory; no best k or ε has been established."
+            ),
+        ]
+    )
+    return
+
+
+@app.function(hide_code=True)
+def display_ranked_cluster_population(
+    population, prepared, result, eps, min_samples
+):
+    """Show both fits in one fixed projection, plus tuning and membership evidence."""
+    plot_data = result["members"].filter(pl.col("cluster") != "Unclusterable")
+    cluster_count = int(result["metrics"]["clusters"].max())
+    cluster_domain = [
+        f"Cluster {index}" for index in range(1, cluster_count + 1)
+    ] + ["Noise"]
+    cluster_colors = [
+        f"hsl({(index * 137.508 + 215) % 360:.1f},65%,55%)"
+        for index in range(cluster_count)
+    ] + ["#94a3b8"]
+    charts = []
+    for algorithm in ["K-means", "DBSCAN"]:
+        chart = (
+            alt.Chart(plot_data.filter(pl.col("algorithm") == algorithm))
+            .mark_circle(size=70, opacity=0.8, stroke="white", strokeWidth=0.5)
+            .encode(
+                x=alt.X(
+                    "svd_1:Q", title="SVD component 1", scale=alt.Scale(zero=False)
+                ),
+                y=alt.Y(
+                    "svd_2:Q", title="SVD component 2", scale=alt.Scale(zero=False)
+                ),
+                color=alt.Color(
+                    "cluster:N",
+                    title="Assignment",
+                    scale=alt.Scale(domain=cluster_domain, range=cluster_colors),
+                    legend=alt.Legend(orient="bottom", columns=4),
+                ),
+                tooltip=[
+                    alt.Tooltip("id:N", title="ID"),
+                    alt.Tooltip("label:N", title="Member"),
+                    alt.Tooltip("rank:Q", title="PageRank rank", format=",.1f"),
+                    alt.Tooltip("pagerank:Q", title="PageRank", format=".5g"),
+                    alt.Tooltip(
+                        "memberships:Q", title="Recorded memberships", format=",d"
+                    ),
+                    alt.Tooltip("cluster:N", title="Assignment"),
+                ],
+            )
+            .properties(
+                title=f"{population} · {algorithm}", width="container", height=330
+            )
+            .interactive()
+        )
+        # Show only labels present in this fit, retaining the shared color mapping.
+        present = set(
+            plot_data.filter(pl.col("algorithm") == algorithm)["cluster"].to_list()
+        )
+        chart = chart.encode(
+            color=alt.Color(
+                "cluster:N",
+                title="Assignment",
+                scale=alt.Scale(
+                    domain=[label for label in cluster_domain if label in present],
+                    range=[
+                        color
+                        for label, color in zip(cluster_domain, cluster_colors)
+                        if label in present
+                    ],
+                ),
+                legend=alt.Legend(orient="bottom", columns=4),
+            )
+        )
+        charts.append(
+            mo.ui.altair_chart(chart, chart_selection=False, legend_selection=False)
+        )
+    size = prepared["profiles"].shape[0]
+    neighbor_view = mo.md(
+        "Too few usable profiles for the selected minimum-neighbor count."
+    )
+    if size >= min_samples:
+        # The row includes distance zero to self, as DBSCAN min_samples does.
+        neighbor_distances = np.sort(
+            np.partition(prepared["distances"], min_samples - 1, axis=1)[
+                :, min_samples - 1
+            ]
+        )
+        neighbor_data = pl.DataFrame(
+            {
+                "ordered_profile": np.arange(1, size + 1),
+                "neighbor_distance": neighbor_distances,
+            }
+        )
+        curve = (
+            alt.Chart(neighbor_data)
+            .mark_line(color="#475569")
+            .encode(
+                x=alt.X(
+                    "ordered_profile:Q",
+                    title="Usable profiles ordered by neighbor distance",
+                ),
+                y=alt.Y(
+                    "neighbor_distance:Q",
+                    title="Distance to required neighbor",
+                    scale=alt.Scale(zero=True),
+                ),
+                tooltip=[
+                    alt.Tooltip("ordered_profile:Q"),
+                    alt.Tooltip("neighbor_distance:Q", format=".3f"),
+                ],
+            )
+        )
+        threshold = (
+            alt.Chart(pl.DataFrame({"epsilon": [eps]}))
+            .mark_rule(color="#ea580c", strokeDash=[6, 4])
+            .encode(
+                y="epsilon:Q",
+                tooltip=[alt.Tooltip("epsilon:Q", title="ε", format=".2f")],
+            )
+        )
+        neighbor_view = mo.ui.altair_chart(
+            (curve + threshold).properties(
+                width="container",
+                height=190,
+                title=f"DBSCAN tuning · ε = {eps:.2f}; minimum neighbors = {min_samples}",
+            ),
+            chart_selection=False,
+            legend_selection=False,
+        )
+    group_table = result["groups"].rename(
+        {
+            "common_profile_memberships": "common_features"
+            if population == "Accounts"
+            else "common_accounts"
+        }
+    )
+    member_tables = {
+        algorithm: mo.ui.table(
+            result["members"]
+            .filter(pl.col("algorithm") == algorithm)
+            .drop("algorithm", "svd_1", "svd_2"),
+            selection=None,
+            pagination=True,
+            page_size=10,
+            show_data_types=False,
+            show_column_summaries=False,
+            format_mapping={"pagerank": "{:.6g}", "rank": "{:,.1f}"},
+        )
+        for algorithm in ["K-means", "DBSCAN"]
+    }
+    return mo.vstack(
+        [
+            mo.hstack(charts, widths="equal", align="start", gap=1.5),
+            mo.md(
+                "Both plots share one 2D SVD projection, fitted only for display; "
+                "clustering and silhouette use the full profiles. "
+                "Apparent overlap in 2D can hide separation in other dimensions. "
+                "Cluster numbers do not establish correspondence between algorithms. "
+                "Hover for members, scroll to zoom, and drag to pan."
+            ),
+            neighbor_view,
+            mo.md(
+                "The dashed line is ε. Profiles at or below it have enough neighbors "
+                "to be DBSCAN core points; other profiles may join as border points or remain noise. "
+                "A sharp change near √2 signals weak overlap and sensitivity to radius."
+            ),
+            mo.md("#### Group summaries"),
+            mo.ui.table(
+                group_table,
+                selection=None,
+                pagination=True,
+                page_size=10,
+                show_data_types=False,
+                show_column_summaries=False,
+            ),
+            mo.md(
+                "Groups list their five highest-ranked members. Common memberships show up to "
+                "five features (for account clusters) or accounts (for feature clusters), "
+                "ordered by within-group prevalence; percentages are the share of group members "
+                "with that membership. These are descriptive overlaps, not enrichment scores."
+            ),
+            mo.accordion(
+                {
+                    "Browse every assignment (including noise and unclusterable accounts)": mo.ui.tabs(
+                        member_tables
+                    )
+                }
+            ),
+        ]
+    )
+
+
+@app.cell(hide_code=True)
+def display_ranked_profile_clustering(
+    ranked_cluster_account_eps,
+    ranked_cluster_feature_eps,
+    ranked_cluster_min_samples,
+    ranked_cluster_profiles,
+    ranked_cluster_results,
+):
+    mo.ui.tabs(
+        {
+            _population: display_ranked_cluster_population(
+                _population,
+                ranked_cluster_profiles[_population],
+                _result,
+                ranked_cluster_account_eps.value
+                if _population == "Accounts"
+                else ranked_cluster_feature_eps.value,
+                ranked_cluster_min_samples.value,
+            )
+            for _population, _result in ranked_cluster_results.items()
+        }
     )
     return
 
