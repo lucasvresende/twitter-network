@@ -118,11 +118,19 @@ def dashboard_navigation():
         label="Connectivity view",
     )
     feature_view_tabs = mo.ui.tabs(
-        {_label: "" for _label in ["Feature rankings", "Account rankings", "Network"]},
+        {
+            _label: ""
+            for _label in [
+                "Feature rankings",
+                "Account rankings",
+                "Network",
+                "Compare features",
+            ]
+        },
         label="Feature model view",
     )
     clustering_view_tabs = mo.ui.tabs(
-        {_label: "" for _label in ["Accounts", "Features"]},
+        {_label: "" for _label in ["Accounts", "Features", "Seeded neighborhoods"]},
         label="Clustering population",
     )
     ego_view_tabs = mo.ui.tabs(
@@ -272,6 +280,776 @@ def dashboard_connectivity(
 
 
 @app.cell(hide_code=True)
+def catalog_manual_feature_comparison(
+    degree_counts,
+    feature_pagerank_account_counts,
+    feature_pagerank_catalog,
+    network_node_ids,
+):
+    manual_feature_catalog = (
+        feature_pagerank_catalog.with_columns(
+            pl.Series("users", feature_pagerank_account_counts)
+        )
+        .filter(pl.col("users") >= 100)
+        .with_columns(
+            (pl.col("users") / len(network_node_ids)).alias("share_of_all_users")
+        )
+        .sort(["users", "name", "id"], descending=[True, False, False])
+    )
+    manual_feature_account_degrees = degree_counts.select(
+        "node",
+        (
+            pl.col("followers_count").cast(pl.Int64)
+            + pl.col("following_count").cast(pl.Int64)
+        ).alias("connections"),
+    ).sort("node")
+    return manual_feature_account_degrees, manual_feature_catalog
+
+
+@app.cell(hide_code=True)
+def select_manual_comparison_features(manual_feature_catalog):
+    manual_feature_picker = mo.ui.table(
+        manual_feature_catalog.rename(
+            {
+                "id": "Feature ID",
+                "name": "Feature",
+                "users": "Users with feature",
+                "share_of_all_users": "Share of all users",
+            }
+        ),
+        selection="multi",
+        pagination=True,
+        page_size=8,
+        show_data_types=False,
+        show_column_summaries=False,
+        format_mapping={"Share of all users": "{:.2%}"},
+        label="Choose up to eight features with at least 100 users; search by name",
+    )
+    manual_feature_social_edges = mo.ui.checkbox(
+        value=False, label="Show following edges between displayed users"
+    )
+    manual_feature_account_labels = mo.ui.checkbox(value=False, label="Show user IDs")
+    return (
+        manual_feature_account_labels,
+        manual_feature_picker,
+        manual_feature_social_edges,
+    )
+
+
+@app.cell(hide_code=True)
+def control_manual_feature_limits(manual_feature_picker):
+    manual_selected_features = manual_feature_picker.value.rename(
+        {
+            "Feature ID": "id",
+            "Feature": "name",
+            "Users with feature": "users",
+            "Share of all users": "share_of_all_users",
+        }
+    )
+    if 0 < manual_selected_features.height <= 8:
+        manual_feature_limits = mo.ui.dictionary(
+            {
+                str(row["id"]): mo.ui.number(
+                    start=1,
+                    stop=100,
+                    step=1,
+                    value=min(20, row["users"]),
+                    full_width=True,
+                    label=f"{row['name']} · {row['users']:,} users total",
+                )
+                for row in manual_selected_features.iter_rows(named=True)
+            }
+        ).form(
+            submit_button_label="Compare selected features",
+            bordered=False,
+            validate=lambda values: (
+                "Enter a whole-number user limit from 1 to 100 for every feature."
+                if values is None
+                or any(
+                    value is None
+                    or not np.isfinite(value)
+                    or value != int(value)
+                    or not 1 <= value <= 100
+                    for value in values.values()
+                )
+                else None
+            ),
+        )
+    else:
+        manual_feature_limits = None
+    return manual_feature_limits, manual_selected_features
+
+
+@app.function(hide_code=True)
+def build_manual_feature_comparison(
+    selected,
+    limits,
+    incidence_columns,
+    catalog_ids,
+    account_ids,
+    account_degrees,
+    adjacency,
+    include_social=False,
+):
+    """Compare true feature frequencies with a bounded, deterministic user display."""
+    if not 0 < selected.height <= 8:
+        return {
+            "message": "Select between one and eight features from the catalog."
+        }
+    metadata = {
+        row["node"]: row["connections"]
+        for row in account_degrees.iter_rows(named=True)
+    }
+    selected_rows = list(selected.sort(["name", "id"]).iter_rows(named=True))
+    populations, picks, columns = {}, {}, {}
+    for row in selected_rows:
+        feature_id = row["id"]
+        column = int(np.searchsorted(catalog_ids, feature_id))
+        if column >= len(catalog_ids) or catalog_ids[column] != feature_id:
+            raise ValueError("Selected feature is missing from the global catalog")
+        indices = incidence_columns.indices[
+            incidence_columns.indptr[column] : incidence_columns.indptr[column + 1]
+        ]
+        populations[feature_id] = set(int(index) for index in indices)
+        requested = int(limits[str(feature_id)])
+        if not 1 <= requested <= 100:
+            raise ValueError("Use a user limit from 1 to 100")
+        picks[feature_id] = sorted(
+            populations[feature_id],
+            key=lambda index: (
+                -metadata[int(account_ids[index])],
+                int(account_ids[index]),
+            ),
+        )[:requested]
+        columns[feature_id] = column
+    user_indices = sorted(
+        set().union(*(set(indices) for indices in picks.values()))
+    )
+    memberships = {
+        index: [
+            row["id"] for row in selected_rows if index in populations[row["id"]]
+        ]
+        for index in user_indices
+    }
+    names = {row["id"]: row["name"] for row in selected_rows}
+    graph = nx.Graph()
+    for row in selected_rows:
+        graph.add_node(("feature", row["id"]))
+    for index in user_indices:
+        graph.add_node(("account", int(account_ids[index])))
+        for feature_id in memberships[index]:
+            graph.add_edge(
+                ("feature", feature_id),
+                ("account", int(account_ids[index])),
+                weight=2.0,
+                kind="Feature membership",
+            )
+    social = []
+    if include_social and user_indices:
+        subgraph = adjacency[user_indices, :][:, user_indices].tocoo()
+        for source, target in zip(subgraph.row, subgraph.col):
+            source_id, target_id = (
+                int(account_ids[user_indices[source]]),
+                int(account_ids[user_indices[target]]),
+            )
+            if source_id != target_id:
+                social.append((source_id, target_id))
+                graph.add_edge(
+                    ("account", source_id),
+                    ("account", target_id),
+                    weight=0.15,
+                    kind="Following edge",
+                )
+    positions = nx.spring_layout(graph, seed=42, iterations=70, weight="weight")
+    nodes = []
+    for row in selected_rows:
+        key = ("feature", row["id"])
+        nodes.append(
+            {
+                "key": f"feature:{row['id']}",
+                "id": row["id"],
+                "label": row["name"],
+                "kind": "Feature",
+                "group": row["name"],
+                "connections": len(populations[row["id"]]),
+                "selected_features": row["name"],
+                "x": float(positions[key][0]),
+                "y": float(positions[key][1]),
+            }
+        )
+    for index in user_indices:
+        node_id = int(account_ids[index])
+        groups = memberships[index]
+        key = ("account", node_id)
+        nodes.append(
+            {
+                "key": f"account:{node_id}",
+                "id": node_id,
+                "label": str(node_id),
+                "kind": "User",
+                "group": names[groups[0]] if len(groups) == 1 else "Shared users",
+                "connections": metadata[node_id],
+                "selected_features": ", ".join(
+                    names[feature_id] for feature_id in groups
+                ),
+                "x": float(positions[key][0]),
+                "y": float(positions[key][1]),
+            }
+        )
+    links = []
+    for source, target, attrs in graph.edges(data=True):
+        links.append(
+            {
+                "source": f"{source[0]}:{source[1]}",
+                "target": f"{target[0]}:{target[1]}",
+                "kind": attrs["kind"],
+                "x": float(positions[source][0]),
+                "y": float(positions[source][1]),
+                "x2": float(positions[target][0]),
+                "y2": float(positions[target][1]),
+            }
+        )
+    summary = pl.DataFrame(
+        [
+            {
+                "feature_id": row["id"],
+                "feature": row["name"],
+                "total_users": len(populations[row["id"]]),
+                "requested_users": int(limits[str(row["id"])]),
+                "selected_for_feature": len(picks[row["id"]]),
+                "displayed_users_with_feature": sum(
+                    row["id"] in memberships[index] for index in user_indices
+                ),
+                "shared_users_in_display": sum(
+                    row["id"] in memberships[index] and len(memberships[index]) > 1
+                    for index in user_indices
+                ),
+            }
+            for row in selected_rows
+        ]
+    )
+    overlaps = pl.DataFrame(
+        [
+            {
+                "feature": first["name"],
+                "comparison": second["name"],
+                "feature_users": len(populations[first["id"]]),
+                "shared_users": len(
+                    populations[first["id"]] & populations[second["id"]]
+                ),
+            }
+            for first in selected_rows
+            for second in selected_rows
+        ]
+    )
+    overlaps = overlaps.with_columns(
+        pl.when(pl.col("feature_users") > 0)
+        .then(pl.col("shared_users") / pl.col("feature_users"))
+        .otherwise(None)
+        .alias("share_of_feature_users")
+    )
+    return {
+        "message": None,
+        "nodes": nodes,
+        "links": links,
+        "summary": summary,
+        "overlaps": overlaps,
+        "user_count": len(user_indices),
+        "shared_users": sum(len(features) > 1 for features in memberships.values()),
+        "following_edges": len(social),
+        "feature_names": [row["name"] for row in selected_rows],
+    }
+
+
+@app.cell(hide_code=True)
+def compute_manual_feature_comparison(
+    feature_network_incidence_columns,
+    feature_pagerank_catalog,
+    manual_feature_account_degrees,
+    manual_feature_limits,
+    manual_feature_social_edges,
+    manual_selected_features,
+    network_adjacency,
+    network_node_ids,
+):
+    if manual_selected_features.is_empty():
+        manual_feature_comparison = {
+            "message": "Select feature rows in the catalog to configure their user limits."
+        }
+    elif manual_selected_features.height > 8:
+        manual_feature_comparison = {
+            "message": "Select at most eight features to keep the network readable."
+        }
+    elif manual_feature_limits is None or manual_feature_limits.value is None:
+        manual_feature_comparison = {
+            "message": "Set a separate user limit for each selected feature, then click Compare selected features."
+        }
+    else:
+        manual_feature_comparison = build_manual_feature_comparison(
+            manual_selected_features,
+            manual_feature_limits.value,
+            feature_network_incidence_columns,
+            feature_pagerank_catalog["id"].to_numpy(),
+            network_node_ids,
+            manual_feature_account_degrees,
+            network_adjacency,
+            include_social=manual_feature_social_edges.value,
+        )
+    return (manual_feature_comparison,)
+
+
+@app.function(hide_code=True)
+def compute_manual_feature_pca(
+    comparison, incidence_columns, catalog_ids, account_ids
+):
+    """Exact PCA of centered, unscaled binary memberships for displayed users."""
+    if comparison["message"]:
+        return {"message": comparison["message"]}
+    users = [node for node in comparison["nodes"] if node["kind"] == "User"]
+    features = comparison["summary"].select("feature_id", "feature")
+    if len(users) < 2 or features.height < 2:
+        return {
+            "message": "PCA needs at least two displayed users and two selected features."
+        }
+    user_indices = np.searchsorted(account_ids, [node["id"] for node in users])
+    feature_indices = np.searchsorted(
+        catalog_ids, features["feature_id"].to_numpy()
+    )
+    memberships = (
+        incidence_columns[user_indices, :][:, feature_indices]
+        .toarray()
+        .astype(np.float64)
+    )
+    centered = memberships - memberships.mean(axis=0)
+    if not np.any(centered):
+        return {
+            "message": "All displayed users have identical selected-feature memberships, so there is no variance for PCA. Select different features or increase user limits."
+        }
+    with threadpool_limits(limits=2):
+        _, singular_values, components = np.linalg.svd(
+            centered, full_matrices=False
+        )
+    # Resolve sign ambiguity reproducibly, using the largest coefficient per component.
+    for axis in range(components.shape[0]):
+        if components[axis, np.argmax(np.abs(components[axis]))] < 0:
+            components[axis] *= -1
+    explained = singular_values**2 / np.sum(singular_values**2)
+    tolerance = max(centered.shape) * np.finfo(float).eps * singular_values[0]
+    rank = int(np.count_nonzero(singular_values > tolerance))
+    coordinates = np.zeros((len(users), 2))
+    weights = np.zeros((features.height, 2))
+    dimensions = min(2, rank)
+    coordinates[:, :dimensions] = centered @ components[:dimensions].T
+    weights[:, :dimensions] = components[:dimensions].T
+    ratios = np.zeros(2)
+    ratios[:dimensions] = explained[:dimensions]
+    scores = pl.DataFrame(
+        {
+            "node": [node["id"] for node in users],
+            "group": [node["group"] for node in users],
+            "selected_features": [node["selected_features"] for node in users],
+            "pc1": coordinates[:, 0],
+            "pc2": coordinates[:, 1],
+        }
+    )
+    patterns = (
+        scores.group_by("group", "selected_features")
+        .agg(
+            pl.len().alias("users"),
+            pl.col("pc1").mean(),
+            pl.col("pc2").mean(),
+            pl.col("node")
+            .cast(pl.String)
+            .head(8)
+            .str.join(", ")
+            .alias("example_user_ids"),
+        )
+        .sort(["group", "selected_features"])
+    )
+    vector_scale = (
+        0.75
+        * np.max(np.abs(coordinates))
+        / max(float(np.max(np.linalg.norm(weights, axis=1))), 1e-12)
+    )
+    directions = features.with_columns(
+        pl.Series("pc1_weight", weights[:, 0]),
+        pl.Series("pc2_weight", weights[:, 1]),
+        pl.Series("pc1", weights[:, 0] * vector_scale),
+        pl.Series("pc2", weights[:, 1] * vector_scale),
+        pl.lit(0.0).alias("origin"),
+    )
+    return {
+        "message": None,
+        "scores": scores,
+        "patterns": patterns,
+        "directions": directions,
+        "explained_variance_ratio": ratios,
+        "rank": rank,
+        "memberships": memberships,
+        "components": components,
+        "singular_values": singular_values,
+        "feature_names": features["feature"].to_list(),
+        "user_count": len(users),
+    }
+
+
+@app.cell(hide_code=True)
+def display_manual_feature_pca(
+    feature_network_incidence_columns,
+    feature_pagerank_catalog,
+    manual_feature_comparison,
+    network_node_ids,
+):
+    manual_feature_pca = compute_manual_feature_pca(
+        manual_feature_comparison,
+        feature_network_incidence_columns,
+        feature_pagerank_catalog["id"].to_numpy(),
+        network_node_ids,
+    )
+
+    def _render_manual_feature_pca():
+        result = manual_feature_pca
+        if result["message"]:
+            return mo.vstack(
+                [
+                    mo.md("#### PCA of selected feature memberships"),
+                    mo.md(result["message"]),
+                ]
+            )
+        ratios = result["explained_variance_ratio"]
+        domain = result["feature_names"] + ["Shared users"]
+        colors = [
+            "#2563eb",
+            "#ea580c",
+            "#16a34a",
+            "#9333ea",
+            "#dc2626",
+            "#0891b2",
+            "#ca8a04",
+            "#db2777",
+        ][: len(result["feature_names"])] + ["#64748b"]
+        color_scale = alt.Scale(domain=domain, range=colors)
+        x = alt.X(
+            "pc1:Q",
+            title=f"PC1 ({ratios[0]:.1%} of variance)",
+            scale=alt.Scale(zero=True),
+        )
+        y = alt.Y(
+            "pc2:Q",
+            title=f"PC2 ({ratios[1]:.1%} of variance)",
+            scale=alt.Scale(zero=True),
+        )
+        points = (
+            alt.Chart(result["patterns"])
+            .mark_circle(opacity=0.8, stroke="white", strokeWidth=1)
+            .encode(
+                x=x,
+                y=y,
+                color=alt.Color(
+                    "group:N",
+                    title="Feature group",
+                    scale=color_scale,
+                    legend=alt.Legend(orient="bottom", columns=3),
+                ),
+                size=alt.Size(
+                    "users:Q",
+                    title="Users with identical profile",
+                    scale=alt.Scale(range=[65, 650]),
+                    legend=alt.Legend(orient="bottom"),
+                ),
+                tooltip=[
+                    alt.Tooltip(
+                        "selected_features:N", title="Recorded selected features"
+                    ),
+                    alt.Tooltip("group:N", title="Group"),
+                    alt.Tooltip("users:Q", title="Users at this point"),
+                    alt.Tooltip(
+                        "example_user_ids:N", title="Example user IDs (up to 8)"
+                    ),
+                    alt.Tooltip("pc1:Q", format=".4f"),
+                    alt.Tooltip("pc2:Q", format=".4f"),
+                ],
+            )
+        )
+        base = alt.Chart(result["directions"])
+        lines = base.mark_rule(color="#94a3b8", strokeDash=[4, 3], opacity=0.8).encode(
+            x=alt.X("origin:Q", title=f"PC1 ({ratios[0]:.1%} of variance)"),
+            y=alt.Y("origin:Q", title=f"PC2 ({ratios[1]:.1%} of variance)"),
+            x2="pc1:Q",
+            y2="pc2:Q",
+        )
+        tips = [
+            alt.Tooltip("feature:N", title="Feature direction"),
+            alt.Tooltip("pc1_weight:Q", title="PC1 coefficient", format=".4f"),
+            alt.Tooltip("pc2_weight:Q", title="PC2 coefficient", format=".4f"),
+        ]
+        endpoints = base.mark_point(
+            shape="diamond", filled=True, size=95, stroke="white"
+        ).encode(
+            x=x,
+            y=y,
+            color=alt.Color(
+                "feature:N",
+                title="Feature group",
+                scale=color_scale,
+                legend=alt.Legend(orient="bottom", columns=3),
+            ),
+            tooltip=tips,
+        )
+        labels = base.mark_text(
+            dx=8, dy=-10, align="left", fontWeight="bold", fontSize=11
+        ).encode(x=x, y=y, text="feature:N", tooltip=tips)
+        chart = (
+            alt.layer(lines, points, endpoints, labels)
+            .properties(
+                width="container",
+                height=420,
+                title="PCA: displayed users and selected feature directions",
+            )
+            .interactive()
+        )
+        return mo.vstack(
+            [
+                mo.md("#### PCA of selected feature memberships"),
+                mo.md(
+                    f"**{result['user_count']:,} displayed users** · **{len(result['feature_names'])} selected features** · first two components explain **{ratios.sum():.1%}** of membership variance."
+                ),
+                mo.ui.altair_chart(
+                    chart, chart_selection=False, legend_selection=False
+                ),
+                mo.md(
+                    "Circles represent identical binary membership profiles; size shows the number of users at that point. Colors match the network; gray profiles contain multiple selected features. Dashed lines and diamonds show feature coefficients, rescaled together for visibility; hover for the original coefficients. These are directions, not feature-node or user-group centroids."
+                ),
+                mo.md(
+                    "PCA mean-centers binary memberships without variance scaling and uses exact SVD. It is fitted to the **displayed user selection**, so changing per-feature user limits changes the projection. It does not use following edges, force-layout coordinates, or all dataset users. "
+                    + (
+                        "Only one independent dimension varies; PC2 is zero."
+                        if result["rank"] == 1
+                        else "Nearby profiles are similar in this two-component projection; discarded dimensions can hide differences."
+                    )
+                ),
+                mo.accordion(
+                    {
+                        "PCA coordinates and feature coefficients": mo.vstack(
+                            [
+                                mo.ui.table(
+                                    result["directions"].select(
+                                        "feature", "pc1_weight", "pc2_weight"
+                                    ),
+                                    selection=None,
+                                    pagination=False,
+                                    show_data_types=False,
+                                    show_column_summaries=False,
+                                ),
+                                mo.ui.table(
+                                    result["scores"],
+                                    selection=None,
+                                    pagination=True,
+                                    page_size=10,
+                                    show_data_types=False,
+                                    show_column_summaries=False,
+                                ),
+                            ]
+                        )
+                    }
+                ),
+            ],
+            gap=0.75,
+        )
+
+    manual_feature_pca_view = _render_manual_feature_pca()
+    return (manual_feature_pca_view,)
+
+
+@app.cell(hide_code=True)
+def display_manual_feature_comparison(
+    manual_feature_account_labels,
+    manual_feature_comparison,
+    manual_feature_pca_view,
+    manual_feature_social_edges,
+):
+    def _render_manual_feature_comparison():
+        data = manual_feature_comparison
+        if data["message"]:
+            return mo.md(data["message"])
+        domain = data["feature_names"] + ["Shared users"]
+        colors = [
+            "#2563eb",
+            "#ea580c",
+            "#16a34a",
+            "#9333ea",
+            "#dc2626",
+            "#0891b2",
+            "#ca8a04",
+            "#db2777",
+        ][: len(data["feature_names"])] + ["#64748b"]
+        x = alt.X("x:Q", axis=None, scale=alt.Scale(zero=False, padding=35))
+        y = alt.Y("y:Q", axis=None, scale=alt.Scale(zero=False, padding=35))
+        edges = (
+            alt.Chart(alt.Data(values=data["links"]))
+            .mark_rule(opacity=0.35, strokeWidth=0.8)
+            .encode(
+                x=x,
+                y=y,
+                x2="x2:Q",
+                y2="y2:Q",
+                color=alt.Color(
+                    "kind:N",
+                    title="Connection",
+                    scale=alt.Scale(
+                        domain=["Feature membership", "Following edge"],
+                        range=["#8b5cf6", "#cbd5e1"],
+                    ),
+                    legend=alt.Legend(orient="bottom"),
+                ),
+                tooltip=["source:N", "target:N", "kind:N"],
+            )
+        )
+        base = alt.Chart(alt.Data(values=data["nodes"]))
+        points = base.mark_point(
+            filled=True, opacity=0.95, stroke="white", strokeWidth=1.2
+        ).encode(
+            x=x,
+            y=y,
+            color=alt.Color(
+                "group:N",
+                title="Feature group",
+                scale=alt.Scale(domain=domain, range=colors),
+                legend=alt.Legend(orient="bottom", columns=3),
+            ),
+            shape=alt.Shape(
+                "kind:N",
+                title="Node type",
+                scale=alt.Scale(
+                    domain=["Feature", "User"], range=["diamond", "circle"]
+                ),
+                legend=alt.Legend(orient="bottom"),
+            ),
+            size=alt.condition(
+                alt.datum.kind == "Feature", alt.value(350), alt.value(65)
+            ),
+            tooltip=[
+                alt.Tooltip("label:N", title="Feature / user ID"),
+                "kind:N",
+                alt.Tooltip("group:N", title="Group"),
+                alt.Tooltip(
+                    "selected_features:N", title="Selected feature memberships"
+                ),
+                alt.Tooltip("connections:Q", title="Feature users / user connections"),
+            ],
+        )
+        labels = (
+            base.transform_filter(
+                "true"
+                if manual_feature_account_labels.value
+                else alt.datum.kind == "Feature"
+            )
+            .mark_text(dy=-18, fontSize=11, fontWeight="bold")
+            .encode(x=x, y=y, text="label:N")
+        )
+        chart = (
+            alt.layer(edges, points, labels)
+            .resolve_scale(color="independent")
+            .properties(
+                width="container",
+                height=560,
+                title="Selected features and their connected users",
+            )
+            .configure_view(stroke=None)
+            .interactive()
+        )
+        count_chart = (
+            alt.Chart(data["summary"])
+            .mark_bar(color="#2563a6")
+            .encode(
+                x=alt.X("total_users:Q", title="All users with recorded feature"),
+                y=alt.Y("feature:N", title=None, sort=data["feature_names"]),
+                tooltip=[
+                    "feature:N",
+                    "total_users:Q",
+                    "requested_users:Q",
+                    "selected_for_feature:Q",
+                    "displayed_users_with_feature:Q",
+                ],
+            )
+            .properties(
+                width="container",
+                height=max(150, 30 * len(data["feature_names"])),
+                title="Feature prevalence across the full dataset",
+            )
+        )
+        return mo.vstack(
+            [
+                topic_widget_grid(
+                    [
+                        mo.stat(
+                            str(len(data["feature_names"])), label="Selected features"
+                        ),
+                        mo.stat(
+                            f"{data['user_count']:,}", label="Unique displayed users"
+                        ),
+                        mo.stat(
+                            f"{data['shared_users']:,}",
+                            label="Displayed users with multiple selected features",
+                        ),
+                    ]
+                ),
+                mo.hstack(
+                    [manual_feature_social_edges, manual_feature_account_labels],
+                    justify="start",
+                ),
+                mo.ui.altair_chart(
+                    chart, chart_selection=False, legend_selection=False
+                ),
+                mo.md(
+                    "**Diamonds are features; circles are users.** Shared users appear once in gray and connect to every selected feature they have. Feature memberships are undirected; optional gray social lines collapse following directions. The force layout reflects the displayed memberships, not geography. Hover for details, scroll to zoom, and drag to pan."
+                ),
+                manual_feature_pca_view,
+                mo.ui.altair_chart(
+                    count_chart, chart_selection=False, legend_selection=False
+                ),
+                mo.ui.table(
+                    data["summary"],
+                    selection=None,
+                    pagination=False,
+                    show_data_types=False,
+                    show_column_summaries=False,
+                ),
+                mo.accordion(
+                    {
+                        "Full-population overlap between selected features": mo.ui.table(
+                            data["overlaps"].rename(
+                                {
+                                    "feature": "Source feature",
+                                    "comparison": "Comparison feature",
+                                    "feature_users": "Source users",
+                                    "shared_users": "Shared users",
+                                    "share_of_feature_users": "Source users also with comparison",
+                                }
+                            ),
+                            format_mapping={
+                                "Source users also with comparison": "{:.2%}"
+                            },
+                            selection=None,
+                            pagination=True,
+                            page_size=10,
+                            show_data_types=False,
+                            show_column_summaries=False,
+                        )
+                    }
+                ),
+                mo.md(
+                    "**Overlap percentage:** shared users divided by all users of the source feature in that row. The reverse direction uses the other feature as the denominator; self-overlap is 100%. **Count scope:** total users and pairwise overlaps use all recorded memberships. For each feature, select up to its requested count by highest followers + following count, breaking ties by user ID. Displayed users are the union of those selections. All memberships between those users and selected features are shown, so a feature can have more displayed users than its own selection limit. Annotations are observations, not confirmed interests or complete profiles. Shared PageRank settings do not affect this comparison."
+                ),
+            ],
+            gap=0.75,
+        )
+
+    manual_feature_comparison_view = _render_manual_feature_comparison()
+    return (manual_feature_comparison_view,)
+
+
+@app.cell(hide_code=True)
 def dashboard_feature_model(
     combined_account_ranking_view,
     combined_account_top_count,
@@ -287,6 +1065,9 @@ def dashboard_feature_model(
     feature_pagerank_top_count,
     feature_ranking_view,
     feature_view_tabs,
+    manual_feature_comparison_view,
+    manual_feature_limits,
+    manual_feature_picker,
 ):
     mo.stop(dashboard_tabs.value != "Feature model")
     if feature_view_tabs.value == "Feature rankings":
@@ -299,6 +1080,22 @@ def dashboard_feature_model(
                 topic_widget_grid([combined_account_top_count]),
                 combined_account_ranking_view,
             ]
+        )
+    elif feature_view_tabs.value == "Compare features":
+        _view = mo.vstack(
+            [
+                mo.md(
+                    "Select feature rows in the searchable catalog (up to eight), set the user limit for each, then compare. Feature counts cover the full dataset; network users are a bounded selection."
+                ),
+                mo.accordion(
+                    {"1. Choose features from the catalog": manual_feature_picker}
+                ),
+                manual_feature_limits
+                if manual_feature_limits is not None
+                else mo.md("Choose one to eight features to configure user limits."),
+                manual_feature_comparison_view,
+            ],
+            gap=0.75,
         )
     else:
         _view = mo.vstack(
@@ -319,17 +1116,922 @@ def dashboard_feature_model(
         )
     mo.vstack(
         [
-            mo.md("### Account and feature PageRank"),
             mo.md(
-                f"**Active model:** {feature_pagerank_social_share.value:.0%} following-edge walk share · minimum **{feature_pagerank_min_accounts.value} accounts** per feature. Change these in Shared feature model settings above."
+                "### Manual feature comparison"
+                if feature_view_tabs.value == "Compare features"
+                else "### Account and feature PageRank"
+            ),
+            mo.md(
+                (
+                    "This view compares recorded feature memberships independently of PageRank."
+                    if feature_view_tabs.value == "Compare features"
+                    else f"**Active model:** {feature_pagerank_social_share.value:.0%} following-edge walk share · minimum **{feature_pagerank_min_accounts.value} accounts** per feature. Change these in Shared feature model settings above."
+                )
             ),
             feature_view_tabs,
             _view,
-            mo.accordion({"Methods and scope": feature_model_notes}),
+            (
+                mo.accordion({"Methods and scope": feature_model_notes})
+                if feature_view_tabs.value != "Compare features"
+                else mo.md("")
+            ),
         ],
         gap=0.75,
     )
     return
+
+
+@app.cell(hide_code=True)
+def control_seeded_neighborhood_clustering():
+    seeded_cluster_form = (
+        mo.md("""
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));gap:1rem">
+    {seed}
+    {centers}
+    {minimum}
+    {connections}
+    </div>
+    """)
+        .batch(
+            seed=mo.ui.number(
+                start=0,
+                stop=4294967295,
+                step=1,
+                value=42,
+                label="Random seed",
+                full_width=True,
+            ),
+            centers=mo.ui.number(
+                start=2,
+                stop=30,
+                step=1,
+                value=5,
+                label="Number of initial center nodes (= k)",
+                full_width=True,
+            ),
+            minimum=mo.ui.number(
+                start=1,
+                stop=100000,
+                step=1,
+                value=20,
+                label="Minimum distinct connections for centers",
+                full_width=True,
+            ),
+            connections=mo.ui.number(
+                start=1,
+                stop=200,
+                step=1,
+                value=50,
+                label="Analyzed connections per node (maximum)",
+                full_width=True,
+            ),
+        )
+        .form(
+            submit_button_label="Run seeded K-means",
+            bordered=False,
+            validate=lambda values: (
+                "Enter a whole number in every field."
+                if values is None
+                or any(
+                    value is None or not np.isfinite(value) or value != int(value)
+                    for value in values.values()
+                )
+                else None
+            ),
+        )
+    )
+    return (seeded_cluster_form,)
+
+
+@app.cell(hide_code=True)
+def define_seeded_neighborhood_clustering(sparse):
+    def fit_seeded_neighborhood_clusters(
+        adjacency,
+        node_ids,
+        seed,
+        center_count,
+        minimum_connections,
+        connections_per_node,
+    ):
+        """Initialize K-means from reproducibly sampled nodes' connection profiles."""
+        parameters = (seed, center_count, minimum_connections, connections_per_node)
+        if any(
+            value is None or not np.isfinite(value) or value != int(value)
+            for value in parameters
+        ):
+            raise ValueError("All sampling parameters must be finite integers.")
+        seed, center_count, minimum_connections, connections_per_node = map(
+            int, (seed, center_count, minimum_connections, connections_per_node)
+        )
+        if (
+            seed < 0
+            or center_count < 2
+            or minimum_connections < 1
+            or connections_per_node < 1
+        ):
+            raise ValueError(
+                "Use a nonnegative seed, at least two centers, and positive connection limits."
+            )
+        degrees = np.diff(adjacency.indptr)
+        eligible = np.flatnonzero(degrees >= minimum_connections)
+        if len(eligible) < center_count:
+            return {
+                "message": f"Only {len(eligible):,} nodes meet the minimum connection count; choose fewer centers or lower the minimum.",
+                "eligible": len(eligible),
+            }
+        centers = np.random.default_rng(seed).choice(
+            eligible, size=center_count, replace=False
+        )
+
+        def sampled_neighbors(index):
+            neighbors = adjacency.indices[
+                adjacency.indptr[index] : adjacency.indptr[index + 1]
+            ]
+            if len(neighbors) <= connections_per_node:
+                return neighbors
+            generator = np.random.default_rng(
+                np.random.SeedSequence([seed, int(node_ids[index])])
+            )
+            return np.sort(
+                generator.choice(neighbors, size=connections_per_node, replace=False)
+            )
+
+        center_neighbors = [sampled_neighbors(index) for index in centers]
+        population = np.unique(np.concatenate([centers, *center_neighbors]))
+        neighbors = [sampled_neighbors(index) for index in population]
+        indices = np.concatenate(neighbors)
+        pointers = np.r_[0, np.cumsum([len(row) for row in neighbors])]
+        active = np.unique(indices)
+        binary = sparse.csr_matrix(
+            (np.ones(len(indices)), np.searchsorted(active, indices), pointers),
+            shape=(len(population), len(active)),
+        )
+        profiles = normalize(binary)
+        center_rows = np.searchsorted(population, centers)
+        center_table = pl.DataFrame(
+            {
+                "initial_center": np.arange(1, center_count + 1),
+                "node": node_ids[centers],
+                "connections": degrees[centers],
+                "analyzed_connections": [len(row) for row in center_neighbors],
+            }
+        )
+        supports = [tuple(neighbors[row]) for row in center_rows]
+        if len(set(supports)) < center_count:
+            return {
+                "message": "Some selected centers have identical sampled connection profiles. Change the seed, increase connections per node, or choose fewer centers.",
+                "eligible": len(eligible),
+                "centers": center_table,
+            }
+        initial_centers = profiles[center_rows].toarray()
+        with threadpool_limits(limits=2):
+            model = KMeans(
+                n_clusters=center_count,
+                init=initial_centers,
+                n_init=1,
+                random_state=seed,
+                max_iter=300,
+                algorithm="lloyd",
+            )
+            labels = model.fit_predict(profiles)
+            coordinates = np.zeros((len(population), 2))
+            if min(profiles.shape) > 1:
+                coordinates = TruncatedSVD(
+                    n_components=2, random_state=seed
+                ).fit_transform(profiles)
+            elif profiles.shape[1]:
+                coordinates[:, 0] = profiles.toarray().ravel()
+            own_center_dot = np.zeros(len(labels))
+            for cluster_index in range(center_count):
+                rows = np.flatnonzero(labels == cluster_index)
+                own_center_dot[rows] = profiles[rows].dot(
+                    model.cluster_centers_[cluster_index]
+                )
+            distance = np.sqrt(
+                np.maximum(
+                    np.asarray(profiles.multiply(profiles).sum(axis=1)).ravel()
+                    + np.einsum(
+                        "ij,ij->i", model.cluster_centers_, model.cluster_centers_
+                    )[labels]
+                    - 2 * own_center_dot,
+                    0,
+                )
+            )
+        initial_ids = {
+            int(node_ids[index]): rank for rank, index in enumerate(centers, start=1)
+        }
+        members = pl.DataFrame(
+            {
+                "node": node_ids[population],
+                "cluster": labels + 1,
+                "initial_center": [
+                    initial_ids.get(int(node), None) for node in node_ids[population]
+                ],
+                "connections": degrees[population],
+                "analyzed_connections": np.diff(binary.indptr),
+                "distance_to_centroid": distance,
+                "svd_1": coordinates[:, 0],
+                "svd_2": coordinates[:, 1],
+            }
+        )
+        summary = (
+            members.group_by("cluster")
+            .agg(
+                pl.len().alias("nodes"),
+                pl.col("connections").mean().alias("mean_connections"),
+                pl.col("distance_to_centroid").mean().alias("mean_distance"),
+            )
+            .sort("cluster")
+        )
+        centers_out = center_table.join(
+            members.select("node", pl.col("cluster").alias("final_cluster")),
+            on="node",
+            how="left",
+        )
+        return {
+            "message": None,
+            "eligible": len(eligible),
+            "members": members,
+            "centers": centers_out,
+            "summary": summary,
+            "inertia": float(model.inertia_),
+            "iterations": int(model.n_iter_),
+            "requested_clusters": center_count,
+            "clusters": summary.height,
+            "profile_dimensions": len(active),
+            "sampled_connections": binary.nnz,
+            "seed": seed,
+            "connections_per_node": connections_per_node,
+            "minimum_connections": minimum_connections,
+        }
+
+    return (fit_seeded_neighborhood_clusters,)
+
+
+@app.cell(hide_code=True)
+def prepare_seeded_cluster_graph(network_adjacency, sparse):
+    # Connection profiles treat incoming and outgoing neighbors equally, counting mutuals once.
+    seeded_cluster_adjacency = sparse.csr_matrix(
+        network_adjacency.maximum(network_adjacency.T), dtype=np.float64
+    )
+    seeded_cluster_adjacency.setdiag(0)
+    seeded_cluster_adjacency.eliminate_zeros()
+    seeded_cluster_adjacency.sort_indices()
+    return (seeded_cluster_adjacency,)
+
+
+@app.cell(hide_code=True)
+def compute_seeded_neighborhood_clustering(
+    fit_seeded_neighborhood_clusters,
+    network_node_ids,
+    seeded_cluster_adjacency,
+    seeded_cluster_form,
+):
+    if seeded_cluster_form.value is None:
+        seeded_cluster_result = {
+            "message": "Choose the sampling parameters and click Run seeded K-means."
+        }
+    else:
+        _parameters = seeded_cluster_form.value
+        seeded_cluster_result = fit_seeded_neighborhood_clusters(
+            seeded_cluster_adjacency,
+            network_node_ids,
+            seed=_parameters["seed"],
+            center_count=_parameters["centers"],
+            minimum_connections=_parameters["minimum"],
+            connections_per_node=_parameters["connections"],
+        )
+    return (seeded_cluster_result,)
+
+
+@app.cell(hide_code=True)
+def control_seeded_cluster_network():
+    seeded_network_node_limit = mo.ui.slider(
+        start=50,
+        stop=1000,
+        step=50,
+        value=300,
+        label="Maximum network nodes (initial centers always retained)",
+        full_width=True,
+    )
+    seeded_network_labels = mo.ui.checkbox(value=False, label="Show all node IDs")
+    return seeded_network_labels, seeded_network_node_limit
+
+
+@app.cell(hide_code=True)
+def control_seeded_cluster_feature_markers():
+    seeded_network_feature_markers = mo.ui.checkbox(
+        value=True, label="Show most common feature per cluster"
+    )
+    return (seeded_network_feature_markers,)
+
+
+@app.cell(hide_code=True)
+def display_seeded_cluster_network(
+    network_node_ids,
+    nodes_lf,
+    seeded_cluster_adjacency,
+    seeded_cluster_feature_counts,
+    seeded_cluster_result,
+    seeded_network_feature_markers,
+    seeded_network_labels,
+    seeded_network_node_limit,
+    sparse,
+):
+    def _build_seeded_network():
+        _result = seeded_cluster_result
+        if _result["message"]:
+            return {"nodes": [], "links": []}, mo.md("")
+        _members = _result["members"]
+        _centers = _members.filter(pl.col("initial_center").is_not_null())
+        _others = (
+            _members.filter(pl.col("initial_center").is_null())
+            .sort(["connections", "node"], descending=[True, False])
+            .head(max(0, seeded_network_node_limit.value - _centers.height))
+        )
+        _selected = pl.concat([_centers, _others]).sort("node")
+        _ids = _selected["node"].to_numpy()
+        _indices = np.searchsorted(network_node_ids, _ids)
+        _induced = seeded_cluster_adjacency[_indices, :][:, _indices]
+        _edges = sparse.triu(_induced, k=1).tocoo()
+        _graph = nx.Graph()
+        _graph.add_nodes_from(int(node) for node in _ids)
+        _graph.add_edges_from(
+            (int(_ids[source]), int(_ids[target]))
+            for source, target in zip(_edges.row, _edges.col)
+        )
+        _positions = nx.spring_layout(_graph, seed=_result["seed"], iterations=60)
+        _nodes = [
+            {
+                **row,
+                "group": f"Cluster {row['cluster']}",
+                "role": "Initial center"
+                if row["initial_center"] is not None
+                else "Sampled neighbor",
+                "displayed_connections": int(_graph.degree(int(row["node"]))),
+                "x": float(_positions[row["node"]][0]),
+                "y": float(_positions[row["node"]][1]),
+            }
+            for row in _selected.iter_rows(named=True)
+        ]
+        _links = [
+            {
+                "source": int(source),
+                "target": int(target),
+                "x": float(_positions[source][0]),
+                "y": float(_positions[source][1]),
+                "x2": float(_positions[target][0]),
+                "y2": float(_positions[target][1]),
+            }
+            for source, target in _graph.edges
+        ]
+
+        # Feature markers summarize annotations without changing the account layout.
+        _feature_markers = []
+        _feature_counts = seeded_cluster_feature_counts
+        if _feature_counts is not None and not _feature_counts.is_empty():
+            _top_features = _feature_counts.group_by(
+                "cluster", maintain_order=True
+            ).head(1)
+            _annotations = (
+                nodes_lf.select("node", "features")
+                .join(_selected.select("node").lazy(), on="node", how="inner")
+                .collect()
+            )
+            _features_by_node = {
+                row["node"]: set(row["features"] or [])
+                for row in _annotations.iter_rows(named=True)
+            }
+            for _feature in _top_features.iter_rows(named=True):
+                _group_nodes = [
+                    row for row in _nodes if row["cluster"] == _feature["cluster"]
+                ]
+                if not _group_nodes:
+                    continue
+                _carriers = [
+                    row
+                    for row in _group_nodes
+                    if _feature["feature_id"]
+                    in _features_by_node.get(row["node"], set())
+                ]
+                _anchors = _carriers or _group_nodes
+                _feature_markers.append(
+                    {
+                        **_feature,
+                        "group": f"Cluster {_feature['cluster']}",
+                        "role": "Most common feature",
+                        "label": f"C{_feature['cluster']}: {_feature['feature']}",
+                        "displayed_members_with_feature": len(_carriers),
+                        "position_basis": "Mean position of displayed members with this feature"
+                        if _carriers
+                        else "Mean cluster position; no displayed members have this feature",
+                        "x": float(np.mean([row["x"] for row in _anchors])),
+                        "y": float(np.mean([row["y"] for row in _anchors])),
+                    }
+                )
+        _x = alt.X("x:Q", axis=None, scale=alt.Scale(zero=False, padding=25))
+        _y = alt.Y("y:Q", axis=None, scale=alt.Scale(zero=False, padding=25))
+        _edge_chart = (
+            alt.Chart(alt.Data(values=_links))
+            .mark_rule(color="#94a3b8", opacity=0.25, strokeWidth=0.7)
+            .encode(
+                x=_x,
+                y=_y,
+                x2="x2:Q",
+                y2="y2:Q",
+                tooltip=[
+                    alt.Tooltip("source:N", title="Connected node"),
+                    alt.Tooltip("target:N", title="Connected node"),
+                ],
+            )
+        )
+        _base = alt.Chart(alt.Data(values=_nodes))
+        _points = _base.mark_point(
+            filled=True, opacity=0.95, stroke="white", strokeWidth=1
+        ).encode(
+            x=_x,
+            y=_y,
+            color=alt.Color(
+                "group:N",
+                title="Final cluster",
+                scale=alt.Scale(
+                    domain=[
+                        f"Cluster {i}"
+                        for i in range(1, _result["requested_clusters"] + 1)
+                    ],
+                    scheme="tableau20",
+                ),
+                legend=alt.Legend(orient="bottom", columns=5),
+            ),
+            shape=alt.Shape(
+                "role:N",
+                title="Node role",
+                scale=alt.Scale(
+                    domain=[
+                        "Initial center",
+                        "Sampled neighbor",
+                        "Most common feature",
+                    ],
+                    range=["diamond", "circle", "square"],
+                ),
+                legend=alt.Legend(orient="bottom"),
+            ),
+            size=alt.condition(
+                "isValid(datum.initial_center)", alt.value(220), alt.value(65)
+            ),
+            tooltip=[
+                alt.Tooltip("node:N", title="Node ID"),
+                alt.Tooltip("group:N", title="Final cluster"),
+                alt.Tooltip("role:N", title="Node role"),
+                alt.Tooltip("initial_center:Q", title="Initial center number"),
+                alt.Tooltip("connections:Q", title="Global distinct connections"),
+                alt.Tooltip(
+                    "displayed_connections:Q", title="Connections in this plot"
+                ),
+                alt.Tooltip(
+                    "analyzed_connections:Q", title="Sampled profile connections"
+                ),
+            ],
+        )
+        _labels = (
+            _base.transform_filter(
+                "true"
+                if seeded_network_labels.value
+                else "isValid(datum.initial_center)"
+            )
+            .mark_text(dy=-15, fontSize=10)
+            .encode(x=_x, y=_y, text="node:N")
+        )
+        _visible_features = (
+            _feature_markers if seeded_network_feature_markers.value else []
+        )
+        _feature_base = alt.Chart(alt.Data(values=_visible_features))
+        _feature_tooltip = [
+            alt.Tooltip("group:N", title="Cluster"),
+            alt.Tooltip("feature:N", title="Most common recorded feature"),
+            alt.Tooltip("members_with_feature:Q", title="Cluster members with feature"),
+            alt.Tooltip("members:Q", title="All cluster members"),
+            alt.Tooltip(
+                "share_of_members:Q", title="Share of all cluster members", format=".1%"
+            ),
+            alt.Tooltip(
+                "displayed_members_with_feature:Q",
+                title="Displayed members with feature",
+            ),
+            alt.Tooltip("position_basis:N", title="Marker placement"),
+        ]
+        _feature_points = _feature_base.mark_point(
+            filled=True, fill="white", stroke="black", strokeWidth=2, size=180
+        ).encode(
+            x=_x,
+            y=_y,
+            shape=alt.Shape(
+                "role:N",
+                title="Node role",
+                scale=alt.Scale(
+                    domain=[
+                        "Initial center",
+                        "Sampled neighbor",
+                        "Most common feature",
+                    ],
+                    range=["diamond", "circle", "square"],
+                ),
+                legend=alt.Legend(orient="bottom"),
+            ),
+            tooltip=_feature_tooltip,
+        )
+        _feature_text_halo = _feature_base.mark_text(
+            align="left",
+            dx=12,
+            fontSize=11,
+            fontWeight="bold",
+            stroke="white",
+            strokeWidth=3,
+        ).encode(x=_x, y=_y, text="label:N")
+        _feature_text = _feature_base.mark_text(
+            align="left", dx=12, fontSize=11, fontWeight="bold", color="#111827"
+        ).encode(x=_x, y=_y, text="label:N", tooltip=_feature_tooltip)
+        _chart = (
+            alt.layer(
+                _edge_chart,
+                _points,
+                _labels,
+                _feature_points,
+                _feature_text_halo,
+                _feature_text,
+            )
+            .properties(
+                width="container",
+                height=520,
+                title="Connection network colored by K-means cluster",
+            )
+            .configure_view(stroke=None)
+            .interactive()
+        )
+        _scope = (
+            "All clustered nodes are shown."
+            if _selected.height == _members.height
+            else "All initial centers are retained; other displayed nodes are selected by global distinct connection count, then node ID. The display limit does not change clustering."
+        )
+        _view = mo.vstack(
+            [
+                topic_widget_grid(
+                    [
+                        seeded_network_node_limit,
+                        seeded_network_labels,
+                        seeded_network_feature_markers,
+                    ]
+                ),
+                mo.md(
+                    f"**{_selected.height:,} of {_members.height:,} clustered nodes** · **{len(_links):,} observed connections** · **{_centers.height} initial centers**. "
+                    + _scope
+                ),
+                mo.ui.altair_chart(
+                    _chart, chart_selection=False, legend_selection=False
+                ),
+                mo.md(
+                    "Labeled squares mark each visible cluster's most common recorded feature, ranked across the full cluster (ties by feature name, then ID). Squares sit at the mean position of displayed members with that feature, falling back to the displayed cluster mean if none have it. These are annotation summaries, not geographic locations or additional graph nodes. Clusters without recorded annotations have no feature marker. Colors show final cluster assignments; diamonds mark the original sampled center nodes. Lines show **all observed connections between displayed nodes**, counting mutual links once and ignoring direction, as in the connection profiles. These can include edges not selected by the per-node profile sampling cap. Positions use a seeded force layout, not K-means or SVD coordinates. Hover for details; scroll to zoom, drag to pan, and double-click to reset."
+                ),
+            ],
+            gap=0.75,
+        )
+        return {
+            "feature_markers": _feature_markers,
+            "nodes": _nodes,
+            "links": _links,
+            "total_nodes": _members.height,
+            "initial_centers": _centers.height,
+        }, _view
+
+    seeded_cluster_network_data, seeded_cluster_network_view = _build_seeded_network()
+    return (seeded_cluster_network_view,)
+
+
+@app.function(hide_code=True)
+def summarize_seeded_cluster_features(members, annotations, catalog, top_n=5):
+    """Describe recorded feature prevalence; empty annotation lists remain unobserved."""
+    frame = (
+        members.select("node", "cluster")
+        .join(
+            annotations.select("node", "features"),
+            on="node",
+            how="left",
+            validate="1:1",
+        )
+        .with_columns(
+            pl.col("features")
+            .fill_null(pl.lit([], dtype=pl.List(pl.Int64)))
+            .list.unique()
+        )
+    )
+    coverage = (
+        frame.group_by("cluster")
+        .agg(
+            pl.len().alias("members"),
+            (pl.col("features").list.len() > 0).sum().alias("annotated_members"),
+        )
+        .with_columns(
+            (pl.col("annotated_members") / pl.col("members")).alias(
+                "annotation_coverage"
+            )
+        )
+        .sort("cluster")
+    )
+    counts = (
+        frame.select("cluster", pl.col("features").alias("feature_id"))
+        .explode("feature_id")
+        .filter(pl.col("feature_id").is_not_null())
+        .group_by("cluster", "feature_id")
+        .len(name="members_with_feature")
+        .join(
+            catalog.select(
+                pl.col("id").alias("feature_id"), pl.col("name").alias("feature")
+            ),
+            on="feature_id",
+            how="left",
+            validate="m:1",
+        )
+        .join(coverage, on="cluster", how="left", validate="m:1")
+        .with_columns(
+            (pl.col("members_with_feature") / pl.col("members")).alias(
+                "share_of_members"
+            ),
+            (pl.col("members_with_feature") / pl.col("annotated_members")).alias(
+                "share_of_annotated_members"
+            ),
+        )
+        .sort(
+            ["cluster", "members_with_feature", "feature", "feature_id"],
+            descending=[False, True, False, False],
+        )
+    )
+    top = (
+        counts.filter(pl.col("members_with_feature") >= 2)
+        .group_by("cluster", maintain_order=True)
+        .head(top_n)
+    )
+    descriptions = {}
+    for row in top.iter_rows(named=True):
+        descriptions.setdefault(row["cluster"], []).append(
+            f"{row['feature']} ({row['members_with_feature']}/{row['members']}; {row['share_of_members']:.0%})"
+        )
+    summary = coverage.with_columns(
+        pl.Series(
+            "common_features",
+            [
+                "; ".join(descriptions.get(row["cluster"], []))
+                or (
+                    "No recorded features"
+                    if row["annotated_members"] == 0
+                    else "No feature shared by at least two members"
+                )
+                for row in coverage.iter_rows(named=True)
+            ],
+            dtype=pl.String,
+        )
+    )
+    return summary, counts
+
+
+@app.cell(hide_code=True)
+def display_seeded_cluster_features(feats_lf, nodes_lf, seeded_cluster_result):
+    if seeded_cluster_result["message"]:
+        seeded_cluster_feature_summary = None
+        seeded_cluster_feature_counts = None
+        seeded_cluster_feature_view = mo.md("")
+    else:
+        _members = seeded_cluster_result["members"]
+        _annotations = (
+            nodes_lf.select("node", "features")
+            .join(_members.select("node").lazy(), on="node", how="inner")
+            .collect()
+        )
+        seeded_cluster_feature_summary, seeded_cluster_feature_counts = (
+            summarize_seeded_cluster_features(
+                _members, _annotations, feats_lf.select("id", "name").collect()
+            )
+        )
+        seeded_cluster_feature_view = mo.vstack(
+            [
+                mo.md("#### Common recorded features by cluster"),
+                mo.md(
+                    "The five most prevalent features shared by **at least two members** in each cluster. Each entry shows **members with feature / all cluster members (percentage)**. Summaries include every clustered node, including those hidden by the network display limit."
+                ),
+                mo.ui.table(
+                    seeded_cluster_feature_summary.rename(
+                        {
+                            "cluster": "Cluster",
+                            "members": "Members",
+                            "annotated_members": "Members with recorded features",
+                            "annotation_coverage": "Annotation coverage",
+                            "common_features": "Top common features",
+                        }
+                    ),
+                    selection=None,
+                    pagination=True,
+                    page_size=10,
+                    show_data_types=False,
+                    show_column_summaries=False,
+                    format_mapping={"Annotation coverage": "{:.1%}"},
+                ),
+                mo.accordion(
+                    {
+                        "All feature frequencies by cluster": mo.ui.table(
+                            seeded_cluster_feature_counts,
+                            selection=None,
+                            pagination=True,
+                            page_size=10,
+                            show_data_types=False,
+                            show_column_summaries=False,
+                            format_mapping={
+                                "share_of_members": "{:.1%}",
+                                "share_of_annotated_members": "{:.1%}",
+                                "annotation_coverage": "{:.1%}",
+                            },
+                        )
+                    }
+                ),
+                mo.md(
+                    "Empty feature lists mean no recorded active annotations, not confirmed absence. These are descriptive frequencies, not enrichment or significance tests. Features describe the connection-based clusters and do not affect K-means assignments."
+                ),
+            ],
+            gap=0.75,
+        )
+    return seeded_cluster_feature_counts, seeded_cluster_feature_view
+
+
+@app.cell(hide_code=True)
+def display_seeded_neighborhood_clustering(
+    seeded_cluster_feature_view,
+    seeded_cluster_network_view,
+    seeded_cluster_result,
+):
+    def _build_seeded_cluster_view():
+        _result = seeded_cluster_result
+        if _result["message"]:
+            _parts = [mo.md(_result["message"])]
+            if "centers" in _result:
+                _parts.append(
+                    mo.ui.table(_result["centers"], selection=None, pagination=False)
+                )
+            return mo.vstack(_parts)
+        _members = _result["members"].with_columns(
+            (pl.lit("Cluster ") + pl.col("cluster").cast(pl.String)).alias("group")
+        )
+        _scatter = (
+            alt.Chart(_members)
+            .mark_point(filled=True, opacity=0.8, stroke="white", strokeWidth=0.7)
+            .encode(
+                x=alt.X(
+                    "svd_1:Q", title="SVD component 1", scale=alt.Scale(zero=False)
+                ),
+                y=alt.Y(
+                    "svd_2:Q", title="SVD component 2", scale=alt.Scale(zero=False)
+                ),
+                color=alt.Color(
+                    "group:N",
+                    title="Final cluster",
+                    sort=[
+                        f"Cluster {i}"
+                        for i in range(1, _result["requested_clusters"] + 1)
+                    ],
+                    scale=alt.Scale(
+                        domain=[
+                            f"Cluster {i}"
+                            for i in range(1, _result["requested_clusters"] + 1)
+                        ],
+                        scheme="tableau20",
+                    ),
+                ),
+                shape=alt.condition(
+                    "isValid(datum.initial_center)",
+                    alt.value("diamond"),
+                    alt.value("circle"),
+                ),
+                size=alt.condition(
+                    "isValid(datum.initial_center)", alt.value(180), alt.value(55)
+                ),
+                tooltip=[
+                    alt.Tooltip("node:N", title="Node ID"),
+                    alt.Tooltip("group:N", title="Final cluster"),
+                    alt.Tooltip("initial_center:Q", title="Initial center number"),
+                    alt.Tooltip("connections:Q", title="Distinct connections"),
+                    alt.Tooltip("analyzed_connections:Q", title="Sampled connections"),
+                    alt.Tooltip(
+                        "distance_to_centroid:Q",
+                        title="Distance to final centroid",
+                        format=".4f",
+                    ),
+                ],
+            )
+            .properties(
+                width="container",
+                height=360,
+                title="Clusters of sampled connection profiles",
+            )
+            .interactive()
+        )
+        _sizes = (
+            alt.Chart(_result["summary"])
+            .mark_bar(color="#2563a6")
+            .encode(
+                x=alt.X("nodes:Q", title="Assigned nodes"),
+                y=alt.Y("cluster:O", title="Final cluster", sort="ascending"),
+                tooltip=[
+                    "cluster:O",
+                    "nodes:Q",
+                    alt.Tooltip("mean_connections:Q", format=".1f"),
+                ],
+            )
+            .properties(width="container", height=360, title="Cluster sizes")
+        )
+        return mo.vstack(
+            [
+                topic_widget_grid(
+                    [
+                        mo.stat(
+                            f"{_result['eligible']:,}", label="Eligible initial centers"
+                        ),
+                        mo.stat(
+                            f"{_members.height:,}",
+                            label="Nodes clustered",
+                            caption="Sampled centers and their sampled neighbors",
+                        ),
+                        mo.stat(
+                            f"{_result['clusters']} / {_result['requested_clusters']}",
+                            label="Final / requested clusters",
+                        ),
+                        mo.stat(str(_result["iterations"]), label="K-means iterations"),
+                    ]
+                ),
+                mo.md(
+                    f"**Run:** seed {_result['seed']} · {_result['requested_clusters']} initial centers · minimum {_result['minimum_connections']} connections · at most {_result['connections_per_node']} connections per profile."
+                ),
+                seeded_cluster_network_view,
+                seeded_cluster_feature_view,
+                mo.accordion(
+                    {
+                        "Profile projection and cluster sizes": mo.vstack(
+                            [
+                                mo.hstack(
+                                    [
+                                        mo.ui.altair_chart(
+                                            _scatter,
+                                            chart_selection=False,
+                                            legend_selection=False,
+                                        ),
+                                        mo.ui.altair_chart(
+                                            _sizes,
+                                            chart_selection=False,
+                                            legend_selection=False,
+                                        ),
+                                    ],
+                                    widths="equal",
+                                    align="start",
+                                    gap=1.5,
+                                ),
+                                mo.md(
+                                    "Diamonds mark the **original sampled center nodes**, colored by final assignment. Coordinates are a 2D SVD projection for display; K-means uses the full sampled profiles. Final centroids move during fitting and are not node positions."
+                                ),
+                            ]
+                        )
+                    }
+                ),
+                mo.accordion(
+                    {
+                        "Selected initial center nodes": mo.ui.table(
+                            _result["centers"],
+                            selection=None,
+                            pagination=False,
+                            show_data_types=False,
+                            show_column_summaries=False,
+                        ),
+                        "Cluster summary": mo.ui.table(
+                            _result["summary"],
+                            selection=None,
+                            pagination=False,
+                            show_data_types=False,
+                            show_column_summaries=False,
+                        ),
+                        "All node assignments": mo.ui.table(
+                            _members.drop("svd_1", "svd_2", "group"),
+                            selection=None,
+                            pagination=True,
+                            page_size=10,
+                            show_data_types=False,
+                            show_column_summaries=False,
+                        ),
+                        "Fit diagnostics": mo.md(
+                            f"Squared Euclidean inertia: **{_result['inertia']:.4f}**. Profiles have **{_result['profile_dimensions']:,} active neighbor dimensions** and **{_result['sampled_connections']:,} sampled memberships**. One initialization uses the selected nodes exactly; Lloyd iterations stop at convergence or 300 iterations. Different final centers or fewer occupied clusters can occur. Inertia is not comparable across different sampled datasets."
+                        ),
+                    }
+                ),
+            ],
+            gap=0.75,
+        )
+
+    seeded_cluster_view = _build_seeded_cluster_view()
+    return (seeded_cluster_view,)
 
 
 @app.cell(hide_code=True)
@@ -347,35 +2049,67 @@ def dashboard_clustering(
     ranked_cluster_min_samples,
     ranked_cluster_population_views,
     ranked_cluster_top_count,
+    seeded_cluster_form,
+    seeded_cluster_view,
 ):
     mo.stop(dashboard_tabs.value != "Clustering")
     _population = clustering_view_tabs.value
-    _population_controls = (
-        [ranked_cluster_account_ranking, ranked_cluster_account_eps]
-        if _population == "Accounts"
-        else [ranked_cluster_feature_eps]
-    )
-    mo.vstack(
-        [
-            mo.md("### Cluster ranked profiles"),
-            mo.md(
-                f"**Active feature model:** {feature_pagerank_social_share.value:.0%} following-edge walk share · minimum **{feature_pagerank_min_accounts.value} accounts** per feature. These shared settings affect candidates; ranking display limits do not."
-            ),
-            topic_widget_grid(
-                [ranked_cluster_top_count, ranked_cluster_k, ranked_cluster_min_samples]
-            ),
-            clustering_view_tabs,
-            topic_widget_grid(_population_controls),
-            ranked_cluster_population_views[_population],
-            mo.accordion(
-                {
-                    "Coverage and separation diagnostics": cluster_diagnostics_view,
-                    "Methods and scope": clustering_method_notes,
-                }
-            ),
-        ],
-        gap=0.75,
-    )
+    if _population == "Seeded neighborhoods":
+        _content = mo.vstack(
+            [
+                mo.md("### Seeded neighborhood K-means"),
+                mo.md(
+                    "Sample nodes as initial K-means centers, then cluster them and their sampled neighbors by shared connection profiles. This analysis is independent of PageRank and recorded features."
+                ),
+                seeded_cluster_form,
+                seeded_cluster_view,
+                mo.accordion(
+                    {
+                        "Sampling and model definition": mo.md(
+                            "Centers are sampled uniformly without replacement among nodes meeting the minimum **distinct-neighbor** count. "
+                            "Connections combine incoming and outgoing neighbors, count mutual relationships once, and omit self-loops. "
+                            "For each center, sample up to the connection limit without replacement; the clustering population is the union of those neighbors and the centers. "
+                            "The minimum-degree filter applies to centers, not their neighbors. Every population node is represented by up to the same number of its own global neighbors, sampled deterministically from the seed and node ID. "
+                            "Binary neighbor profiles are L2-normalized; common neighbors determine similarity. K-means uses Euclidean distance and the selected nodes' profiles as initial centers, with one initialization. "
+                            "Centroids are updated during fitting; center nodes and neighbors can change assignments. The same submitted inputs reproduce sampling and fitting. "
+                            "This is exploratory connection-profile similarity within sampled neighborhoods, not a partition of the entire network or proof of social communities."
+                        )
+                    }
+                ),
+            ],
+            gap=0.75,
+        )
+    else:
+        _population_controls = (
+            [ranked_cluster_account_ranking, ranked_cluster_account_eps]
+            if _population == "Accounts"
+            else [ranked_cluster_feature_eps]
+        )
+        _content = mo.vstack(
+            [
+                mo.md("### Cluster ranked profiles"),
+                mo.md(
+                    f"**Active feature model:** {feature_pagerank_social_share.value:.0%} following-edge walk share · minimum **{feature_pagerank_min_accounts.value} accounts** per feature. These shared settings affect candidates; ranking display limits do not."
+                ),
+                topic_widget_grid(
+                    [
+                        ranked_cluster_top_count,
+                        ranked_cluster_k,
+                        ranked_cluster_min_samples,
+                    ]
+                ),
+                topic_widget_grid(_population_controls),
+                ranked_cluster_population_views[_population],
+                mo.accordion(
+                    {
+                        "Coverage and separation diagnostics": cluster_diagnostics_view,
+                        "Methods and scope": clustering_method_notes,
+                    }
+                ),
+            ],
+            gap=0.75,
+        )
+    mo.vstack([clustering_view_tabs, _content], gap=0.75)
     return
 
 
