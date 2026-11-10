@@ -6,20 +6,20 @@ __generated_with = "0.25.2"
 app = marimo.App(width="medium", auto_download=["html"], sql_output="native")
 
 with app.setup:
+    from hashlib import sha256
     from pathlib import Path
     from tempfile import TemporaryDirectory
 
-    import marimo as mo
-    import polars as pl
-    import numpy as np
     import altair as alt
+    import marimo as mo
     import networkx as nx
+    import numpy as np
+    import polars as pl
     from sklearn.cluster import DBSCAN, KMeans
     from sklearn.decomposition import TruncatedSVD
     from sklearn.metrics import pairwise_distances, silhouette_score
     from sklearn.preprocessing import normalize
     from threadpoolctl import threadpool_limits
-    from hashlib import sha256
 
 
 @app.cell(hide_code=True)
@@ -393,12 +393,9 @@ def build_manual_feature_comparison(
 ):
     """Compare true feature frequencies with a bounded, deterministic user display."""
     if not 0 < selected.height <= 8:
-        return {
-            "message": "Select between one and eight features from the catalog."
-        }
+        return {"message": "Select between one and eight features from the catalog."}
     metadata = {
-        row["node"]: row["connections"]
-        for row in account_degrees.iter_rows(named=True)
+        row["node"]: row["connections"] for row in account_degrees.iter_rows(named=True)
     }
     selected_rows = list(selected.sort(["name", "id"]).iter_rows(named=True))
     populations, picks, columns = {}, {}, {}
@@ -422,13 +419,9 @@ def build_manual_feature_comparison(
             ),
         )[:requested]
         columns[feature_id] = column
-    user_indices = sorted(
-        set().union(*(set(indices) for indices in picks.values()))
-    )
+    user_indices = sorted(set().union(*(set(indices) for indices in picks.values())))
     memberships = {
-        index: [
-            row["id"] for row in selected_rows if index in populations[row["id"]]
-        ]
+        index: [row["id"] for row in selected_rows if index in populations[row["id"]]]
         for index in user_indices
     }
     names = {row["id"]: row["name"] for row in selected_rows}
@@ -599,9 +592,7 @@ def compute_manual_feature_comparison(
 
 
 @app.function(hide_code=True)
-def compute_manual_feature_pca(
-    comparison, incidence_columns, catalog_ids, account_ids
-):
+def compute_manual_feature_pca(comparison, incidence_columns, catalog_ids, account_ids):
     """Exact PCA of centered, unscaled binary memberships for displayed users."""
     if comparison["message"]:
         return {"message": comparison["message"]}
@@ -612,9 +603,7 @@ def compute_manual_feature_pca(
             "message": "PCA needs at least two displayed users and two selected features."
         }
     user_indices = np.searchsorted(account_ids, [node["id"] for node in users])
-    feature_indices = np.searchsorted(
-        catalog_ids, features["feature_id"].to_numpy()
-    )
+    feature_indices = np.searchsorted(catalog_ids, features["feature_id"].to_numpy())
     memberships = (
         incidence_columns[user_indices, :][:, feature_indices]
         .toarray()
@@ -626,9 +615,7 @@ def compute_manual_feature_pca(
             "message": "All displayed users have identical selected-feature memberships, so there is no variance for PCA. Select different features or increase user limits."
         }
     with threadpool_limits(limits=2):
-        _, singular_values, components = np.linalg.svd(
-            centered, full_matrices=False
-        )
+        _, singular_values, components = np.linalg.svd(centered, full_matrices=False)
     # Resolve sign ambiguity reproducibly, using the largest coefficient per component.
     for axis in range(components.shape[0]):
         if components[axis, np.argmax(np.abs(components[axis]))] < 0:
@@ -1122,11 +1109,9 @@ def dashboard_feature_model(
                 else "### Account and feature PageRank"
             ),
             mo.md(
-                (
-                    "This view compares recorded feature memberships independently of PageRank."
-                    if feature_view_tabs.value == "Compare features"
-                    else f"**Active model:** {feature_pagerank_social_share.value:.0%} following-edge walk share · minimum **{feature_pagerank_min_accounts.value} accounts** per feature. Change these in Shared feature model settings above."
-                )
+                "This view compares recorded feature memberships independently of PageRank."
+                if feature_view_tabs.value == "Compare features"
+                else f"**Active model:** {feature_pagerank_social_share.value:.0%} following-edge walk share · minimum **{feature_pagerank_min_accounts.value} accounts** per feature. Change these in Shared feature model settings above."
             ),
             feature_view_tabs,
             _view,
@@ -2582,9 +2567,7 @@ def cache_lazyframe_to_parquet(
     if needs_write:
         with TemporaryDirectory(prefix=".parquet-", dir=path.parent) as temp_dir:
             temporary_path = Path(temp_dir) / path.name
-            frame.sink_parquet(
-                temporary_path, compression="zstd", metadata=metadata
-            )
+            frame.sink_parquet(temporary_path, compression="zstd", metadata=metadata)
             if (
                 pl.scan_parquet(temporary_path).collect_schema()
                 != frame.collect_schema()
@@ -3387,9 +3370,7 @@ def describe_node_centrality():
 
 
 @app.function(hide_code=True)
-def compute_node_centrality(
-    adjacency, node_ids, tolerance=1e-10, max_iterations=1000
-):
+def compute_node_centrality(adjacency, node_ids, tolerance=1e-10, max_iterations=1000):
     """Compute sparse directed centralities and record convergence diagnostics."""
     graph = adjacency.astype(np.float64).tocsr(copy=True)
     n = len(node_ids)
@@ -3989,7 +3970,7 @@ def describe_components_and_reciprocity():
 
 @app.cell(hide_code=True)
 def import_sparse_graph_tools():
-    import scipy.sparse as sparse
+    from scipy import sparse
     from scipy.sparse.csgraph import connected_components
 
     return connected_components, sparse
@@ -5208,9 +5189,7 @@ def build_top_feature_network_data(
         }
     account_ids = account_metadata["node"].to_numpy()
     account_scores = account_metadata["combined_pagerank"].to_numpy()
-    degree = (
-        account_metadata["in_degree"] + account_metadata["out_degree"]
-    ).to_numpy()
+    degree = (account_metadata["in_degree"] + account_metadata["out_degree"]).to_numpy()
     feature_ids = top["id"].to_numpy()
     feature_columns = np.searchsorted(catalog_ids, feature_ids)
     if np.any(feature_columns >= len(catalog_ids)) or not np.array_equal(
@@ -5245,9 +5224,7 @@ def build_top_feature_network_data(
         )
     account_indices = np.array(sorted(selected_accounts), dtype=np.int64)
     feature_keys = [("feature", int(feature_id)) for feature_id in feature_ids]
-    account_keys = [
-        ("account", int(account_ids[index])) for index in account_indices
-    ]
+    account_keys = [("account", int(account_ids[index])) for index in account_indices]
     graph = nx.DiGraph()
     graph.add_nodes_from(feature_keys + account_keys)
     memberships = incidence_columns[account_indices, :][:, feature_columns].tocoo()
@@ -5270,9 +5247,7 @@ def build_top_feature_network_data(
     positions = nx.spring_layout(graph.to_undirected(), seed=42, iterations=100)
     max_score = max(
         float(top["pagerank"].max()),
-        float(account_scores[account_indices].max())
-        if account_indices.size
-        else 0.0,
+        float(account_scores[account_indices].max()) if account_indices.size else 0.0,
     )
     nodes = []
     for row in top.iter_rows(named=True):
@@ -5307,9 +5282,7 @@ def build_top_feature_network_data(
                 "y": float(positions[key][1]),
                 "pagerank": row["combined_pagerank"],
                 "details": f"Incoming: {row['in_degree']:,}; outgoing: {row['out_degree']:,}",
-                "size": float(
-                    90 + 400 * np.sqrt(row["combined_pagerank"] / max_score)
-                )
+                "size": float(90 + 400 * np.sqrt(row["combined_pagerank"] / max_score))
                 if max_score
                 else 90.0,
             }
@@ -6098,9 +6071,9 @@ def fit_ranked_profile_clusters(
             else np.array([], dtype=int)
         )
         dbscan_labels = (
-            DBSCAN(
-                eps=eps, min_samples=min_samples, metric="precomputed"
-            ).fit_predict(prepared["distances"])
+            DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed").fit_predict(
+                prepared["distances"]
+            )
             if size
             else np.array([], dtype=int)
         )
@@ -6179,9 +6152,7 @@ def fit_ranked_profile_clusters(
             groups.append(
                 {
                     "algorithm": algorithm,
-                    "cluster": "Noise"
-                    if label < 0
-                    else f"Cluster {label_map[label]}",
+                    "cluster": "Noise" if label < 0 else f"Cluster {label_map[label]}",
                     "members": len(positions),
                     "highest_ranked_members": "; ".join(
                         member_table["label"].head(5).to_list()
@@ -6268,15 +6239,13 @@ def display_ranked_cluster_diagnostics(ranked_cluster_diagnostics):
 
 
 @app.function(hide_code=True)
-def display_ranked_cluster_population(
-    population, prepared, result, eps, min_samples
-):
+def display_ranked_cluster_population(population, prepared, result, eps, min_samples):
     """Show both fits in one fixed projection, plus tuning and membership evidence."""
     plot_data = result["members"].filter(pl.col("cluster") != "Unclusterable")
     cluster_count = int(result["metrics"]["clusters"].max())
-    cluster_domain = [
-        f"Cluster {index}" for index in range(1, cluster_count + 1)
-    ] + ["Noise"]
+    cluster_domain = [f"Cluster {index}" for index in range(1, cluster_count + 1)] + [
+        "Noise"
+    ]
     cluster_colors = [
         f"hsl({(index * 137.508 + 215) % 360:.1f},65%,55%)"
         for index in range(cluster_count)
