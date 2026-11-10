@@ -7,7 +7,7 @@ import polars as pl
 from twitter_network import paths
 
 
-# %%
+# %% Functions
 def load_edges_csv(file_path: Path) -> pl.LazyFrame:
     return (
         pl.scan_csv(
@@ -55,7 +55,15 @@ def aggregate_friends(edges_lf: pl.LazyFrame) -> pl.LazyFrame:
     )
 
 
+def aggregate_all(edges_lf: pl.LazyFrame) -> pl.LazyFrame:
+    return (
+        edges_lf.pipe(aggregate_followers)
+        .join(aggregate_following(edges_lf), on="node")
+        .join(aggregate_friends(edges_lf), on="node")
+    )
+
+
 # %%
-edges_lf = load_edges_csv(paths.TWITTER_COMBINED_TXT)
+lf = load_edges_csv(paths.TWITTER_COMBINED_TXT).pipe(aggregate_all)
 
 # %%
