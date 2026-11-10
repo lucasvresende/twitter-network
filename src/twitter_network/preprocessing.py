@@ -58,18 +58,4 @@ def aggregate_friends(edges_lf: pl.LazyFrame) -> pl.LazyFrame:
 # %%
 edges_lf = load_edges_csv(paths.TWITTER_COMBINED_TXT)
 
-friendships_in_common_lf = (
-    edges_lf.join(edges_lf, left_on="from", right_on="to")
-    .select(
-        pl.col("from").alias("node_1"),
-        pl.col("from_right").alias("node_2"),
-        pl.col("to").alias("friend"),
-    )
-    .group_by(("node_1", "node_2"))
-    .agg(
-        pl.col("friend").count().alias("friends_in_common_count"),
-        pl.col("friend").implode().alias("friends_in_common"),
-    )
-)
-
 # %%
