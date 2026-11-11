@@ -8,7 +8,7 @@ from twitter_network import paths
 
 
 # %% Functions
-def load_edges_csv(file_path: Path) -> pl.LazyFrame:
+def load_edges_txt(file_path: Path) -> pl.LazyFrame:
     return (
         pl.scan_csv(
             file_path,
@@ -64,6 +64,7 @@ def aggregate_all(edges_lf: pl.LazyFrame) -> pl.LazyFrame:
 
 
 # %%
-lf = load_edges_csv(paths.TWITTER_COMBINED_TXT).pipe(aggregate_all)
+if __name__ == "__main__":
+    lf = load_edges_txt(paths.TWITTER_COMBINED_TXT).pipe(aggregate_all)
 
 # %%
