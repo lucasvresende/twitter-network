@@ -7,7 +7,7 @@ import polars as pl
 from twitter_network import paths
 
 
-# %% feat
+# %%
 def load_feat(feat_path: Path, featnames_path: Path) -> pl.DataFrame:
     feats_df = pl.read_csv(feat_path, separator=" ", has_header=False).transpose()
     feats_df.columns = [str(col_name) for col_name in feats_df.row(0)]
@@ -30,7 +30,6 @@ def filter_node_feats(feats_df: pl.DataFrame, node: int) -> pl.DataFrame:
     )
 
 
-# %%
 def load_all_feats(
     feats_paths: Sequence[Path],
     featnames_paths: Sequence[Path],

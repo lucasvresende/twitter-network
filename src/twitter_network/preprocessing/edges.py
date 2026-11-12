@@ -55,7 +55,7 @@ def aggregate_friends(edges_lf: pl.LazyFrame) -> pl.LazyFrame:
     )
 
 
-def aggregate_all(edges_lf: pl.LazyFrame) -> pl.LazyFrame:
+def aggregate_relationships(edges_lf: pl.LazyFrame) -> pl.LazyFrame:
     return (
         edges_lf.pipe(aggregate_followers)
         .join(aggregate_following(edges_lf), on="node")
@@ -65,6 +65,4 @@ def aggregate_all(edges_lf: pl.LazyFrame) -> pl.LazyFrame:
 
 # %%
 if __name__ == "__main__":
-    lf = load_edges_txt(paths.TWITTER_COMBINED_TXT).pipe(aggregate_all)
-
-# %%
+    lf = load_edges_txt(paths.TWITTER_COMBINED_TXT).pipe(aggregate_relationships)
